@@ -5,9 +5,7 @@ End-to-end prefix caching evaluation on real ShareGPT conversation traces.
 
 **Data preparation:**
 1. Load ShareGPT conversations from CSV (each row = one turn with role + text).
-2. Drop conversations whose total character count across all turns exceeds
-   `max_total_chars` (OOM otherwise).
-3. Take `n_conversations` longest (default 100).
+3. Take `n_conversations` longest (default 100). Crop their length to max_seq_len
 4. For each remaining conversation with T turns, generate T prefix requests:
    - request 0: turn 1 only           (user)
    - request 1: turns 1–2             (user, llm)
@@ -200,23 +198,22 @@ class PrefixCache:
 # ---------------------------------------------------------------------------
 def build_requests(cfg):
     """Load conversations, filter, and generate prefix requests.
-    Selects the longest conversations (by total char count) that fit under
-    max_total_chars, up to n_conversations."""
+    Selects the longest conversations (by total char count) up to n_conversations."""
     e2e = cfg.benchmark_e2e
     df = pd.read_csv(e2e.data_path)
 
     # Compute total character count per conversation
     total_chars = df.groupby('url')['plain_text'].apply(lambda x: x.astype(str).str.len().sum())
-
-    # Keep only conversations within max_total_chars, then take the N longest
-    valid_convs = total_chars[total_chars <= e2e.max_total_chars]
-    longest = valid_convs.sort_values(ascending=False).head(e2e.n_conversations).index
+    longest = total_chars.sort_values(ascending=False).head(e2e.n_conversations).index
     df = df[df['url'].isin(longest)]
 
+    print(f"total {df['plain_text'].apply(lambda x: len(str(x))).sum()} chars")
+    
+    
     # Build prefix requests
     requests = []  # list of (conv_id, n_turns, token_text)
     for conv_id in df['url'].unique():
-        conv = df[df['url'] == conv_id].sort_values('message_index')
+        conv = df[df['url'] == conv_id].sort_values('message_index').head(e2e.max_rounds)
         turns = []
         for _, row in conv.iterrows():
             role = row['role']
@@ -227,8 +224,7 @@ def build_requests(cfg):
             prefix_text = "\n".join(turns[:t])
             requests.append((conv_id, t, prefix_text))
 
-    print(f"Loaded {len(df['url'].unique())} conversations, "
-          f"{len(requests)} prefix requests")
+    print(f"Loaded {len(df['url'].unique())} conversations")
     return requests
 
 
@@ -242,11 +238,24 @@ def tokenize_requests(requests, vocab_size, tokenizer_name="Qwen/Qwen3.5-0.8B", 
         f"Set model.vocab_size >= {tokenizer.vocab_size} in config."
     )
     tokenized = []
+    last_len = {}
     for conv_id, n_turns, text in requests:
-        enc = tokenizer(text, add_special_tokens=False, return_tensors="pt")["input_ids"]
-        if max_seq_len and enc.shape[1] > max_seq_len:
-            enc = enc[:, :max_seq_len]
+        # truncation may result in strange situations where I have several exactly same prompts 
+        # in my request (if non-last round exceeds the len). This patch avoids that:
+        if last_len.get(conv_id,0) >= max_seq_len:
+            continue
+        enc = tokenizer(
+                text, 
+                add_special_tokens=False, 
+                return_tensors="pt",
+                max_length=max_seq_len,
+                truncation=True,
+                truncation_side="left",
+        )["input_ids"]
+
         tokenized.append((conv_id, n_turns, enc))
+        last_len[conv_id] = enc.shape[1]
+    print(len(tokenized))
     return tokenized
 
 
@@ -380,6 +389,7 @@ def main(cfg: DictConfig):
     max_seq_len = e2e.get("max_seq_len", None)
     tokenized = tokenize_requests(requests, config.vocab_size, tokenizer_name=tokenizer_name,
                                   max_seq_len=max_seq_len)
+
 
     # Interleave conversations randomly, but keep turn order within each conversation.
     from collections import defaultdict

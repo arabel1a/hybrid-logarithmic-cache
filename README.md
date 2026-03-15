@@ -70,6 +70,7 @@ Since prefill is compute-bound, FLOP is a good proxy for latency. **Per token pe
 > Note: the code is a mess and neurosloppy, I will (hopefully) update it once
 
 Maximum VRAM i can get is kaggle's T4, so I can't benchmark on hundrend-of-thousands context. But I can verify, that on $\leq 8K$ context my theoretical estimations align well with the real latency and cache size. I speculate here, that if it works as expected on medium context lengths, it will work as expected on larger ones.
+# TODO: add quantization to reduce memory footprint and increase tested max context length.
 
 ![empirical_0_8b](assets/benchmark_baselines_0_8b.png)
 

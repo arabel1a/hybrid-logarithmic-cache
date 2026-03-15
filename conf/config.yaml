@@ -48,8 +48,8 @@ benchmark_baselines:
 benchmark_e2e:
   data_path: data/chatgpt_results_final_language_filtered.csv
   n_conversations: 100
-  max_total_chars: 16_000       #
-  max_seq_len: 16384           # hard cap per request (tokens)
+  max_seq_len: 16384
+  max_rounds: 50 # there are few very long sequences, which bloats the number of requests
   cache_budget_gb: 1.0
   block_size: 16
   seed: 42
