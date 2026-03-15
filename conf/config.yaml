@@ -1,0 +1,58 @@
+# Qwen3.5-0.8B dimensions
+model:
+  name: "Qwen3.5-0.8B"
+  tokenizer: "Qwen/Qwen3.5-0.8B"
+  gdn_layers: 3
+  ga_layers: 1
+  # HF-compatible fields (for checkpoint_cache.py, single layer group)
+  vocab_size: 248044        # real Qwen3.5 vocab size
+  hidden_size: 1024         # = d
+  intermediate_size: 3584   # = d_ff
+  num_hidden_layers: 4      # 1 group = 3 GDN + 1 attn
+  num_attention_heads: 8    # = a_nq
+  num_key_value_heads: 2    # = a_nkv
+  head_dim: 256             # = d_a
+  linear_conv_kernel_dim: 4
+  linear_key_head_dim: 128  # = d_h
+  linear_value_head_dim: 128 # = d_h
+  linear_num_key_heads: 16  # = gdn_nqk
+  linear_num_value_heads: 16 # = gdn_nv
+  max_position_embeddings: 262144
+  rope_theta: 10000000.0
+
+device: mps  # cpu, cuda, mps
+
+test:
+  seq_len: 100
+  seed: 42
+  tolerance: 1.0e-3
+
+profile:
+  seq_len: 1023
+  seed: 42
+  trace_dir: traces
+  n_warmup: 2
+  n_active: 3
+  record_shapes: true
+  profile_memory: true
+  with_stack: true
+  profiler_row_limit: 15
+
+benchmark_baselines:
+  seq_lens: [1023, 1024, 1536, 2047, 2048, 3072, 4095, 4096, 6144, 8191, 8192]
+  block_size: 16
+  n_runs: 3
+  seed: 42
+  output: assets/benchmark_baselines_0_8b.png
+
+benchmark_e2e:
+  data_path: data/chatgpt_results_final_language_filtered.csv
+  n_conversations: 100
+  max_total_chars: 16_000       #
+  max_seq_len: 16384           # hard cap per request (tokens)
+  cache_budget_gb: 1.0
+  block_size: 16
+  seed: 42
+  output_dir: outputs/0_8b
+  boxplots: assets/benchmark_e2e_0_8b.png
+  progress: False
