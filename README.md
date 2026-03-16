@@ -65,6 +65,8 @@ Since prefill is compute-bound, FLOP is a good proxy for latency. **Per token pe
 
 > Block hybrid shown for CUDA (B=16). Note, that full-attention cache and ssm cache can be combined; and for long realistic context size adding logarithmic hybrid cache to kvcache introduce deminishing cache size overhead while reducing computations by a margin.
 
+> **TODO:** although default for vllm steps on cuda, `blocksize=16` seem to be suboptimal for prefix caching. Sweep this.
+
 ### Huggingface Transformers prototype
 
 > Note: the code is a mess and neurosloppy, I will (hopefully) update it once
@@ -83,6 +85,7 @@ To evaluate caching strategies under realistic workloads, `benchmark_e2e.py` rep
 > **IMPORTANT:** a number of simplifications is applied in this tests. See `benchmark_e2e.py` for detailed discussion and real-world applicability of these numbers.
 
 ![ese_speedup](assets/e2e_time_vs_length.png)
+
 > Left panel — Prefill time vs context length. Here i have 40 dialog histories and send them in random order preserving in-conversation order. I measure prefill wall time, cache is stored at CPU. In total, there are 852 requests and 3 GB prefix cache budget (5M tokens overall). Right panel — per-request relative speedup.
 
 Speedup is possible because logarithmic checkpoints use $\sim O(\log L)$ memory per entry (vs $O(L/B)$ for block), so more conversations fit in the 3 GB budget simultaneously, yielding higher hit rates (80% cache hits vs 10% for block-boundary).
