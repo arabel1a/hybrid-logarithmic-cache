@@ -33,7 +33,7 @@ def main(cfg: DictConfig):
     R = 16384  # log resume position (2^14)
 
     print(f"GPU: {torch.cuda.get_device_name()} — "
-          f"{torch.cuda.get_device_properties(0).total_mem/1024**2:.0f}MB total")
+          f"{torch.cuda.get_device_properties(0).total_memory/1024**2:.0f}MB total")
 
     # ============================================================
     # Part 1: Raw kernel memory
