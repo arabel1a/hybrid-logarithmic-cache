@@ -14,9 +14,12 @@ Modifying transformer's cache behavior would involve modifying attention kernel.
 """
 import hybrid_logarithmic_cache
 import gc
+import logging
 import time
 from contextlib import contextmanager
 from pathlib import Path
+
+log = logging.getLogger(__name__)
 
 import numpy as np
 import matplotlib.pyplot as plt
@@ -41,6 +44,9 @@ from hybrid_logarithmic_cache.checkpoint_cache import (
 )
 
 
+def _gpu_mb():
+    return torch.cuda.memory_allocated() / 1024**2
+
 def _free_gpu():
     gc.collect()
     torch.cuda.empty_cache()
@@ -50,7 +56,11 @@ def _block_positions(seq_len, block_size):
     return list(range(block_size, seq_len + 1, block_size))
 
 def prefill_and_capture_at(model, input_ids, ckpt_positions):
-    """Run prefill capturing GDN+conv states and attention KV at specified positions."""
+    """Run prefill capturing GDN+conv states and attention KV at specified positions.
+
+    Checkpoints are moved to CPU immediately after cloning to avoid
+    accumulating all of them on GPU (block-B=16 at 32K = 2048 ckpts ≈ 3.3GB).
+    """
     device = _model_device(model)
     input_ids = input_ids.to(device)
     seq_len = input_ids.shape[1]
@@ -59,8 +69,11 @@ def prefill_and_capture_at(model, input_ids, ckpt_positions):
     attn_layers = _get_attention_layers(config)
 
     ckpt_positions = sorted(set(p for p in ckpt_positions if 0 < p <= seq_len))
-    store = PrefixCheckpointStore(prefix_tokens=input_ids.clone())
+    store = PrefixCheckpointStore(prefix_tokens=input_ids.clone().cpu())
     boundaries = sorted(set([0] + ckpt_positions + [seq_len]))
+
+    log.info("capture %d ckpts for seq_len=%d, boundaries=%d segments, gpu=%.0fMB",
+             len(ckpt_positions), seq_len, len(boundaries) - 1, _gpu_mb())
 
     cache = Qwen3_5DynamicCache(config=config)
     for i in range(len(boundaries) - 1):
@@ -78,19 +91,20 @@ def prefill_and_capture_at(model, input_ids, ckpt_positions):
             store.checkpoints[end] = RecurrentCheckpoint(
                 position=end,
                 recurrent_states={
-                    li: cache.recurrent_states[li].clone()
+                    li: cache.recurrent_states[li].clone().cpu()
                     for li in linear_layers if cache.recurrent_states[li] is not None
                 },
                 conv_states={
-                    li: cache.conv_states[li].clone()
+                    li: cache.conv_states[li].clone().cpu()
                     for li in linear_layers if cache.conv_states[li] is not None
                 },
             )
 
+    log.info("capture done, cloning KV, gpu=%.0fMB", _gpu_mb())
     for li in attn_layers:
         if cache.key_cache[li] is not None:
-            store.kv_cache_keys[li] = cache.key_cache[li].clone()
-            store.kv_cache_values[li] = cache.value_cache[li].clone()
+            store.kv_cache_keys[li] = cache.key_cache[li].clone().cpu()
+            store.kv_cache_values[li] = cache.value_cache[li].clone().cpu()
     return store
 
 
@@ -117,7 +131,8 @@ def _time(n_runs, dev, fn, *args):
     _sync_device(dev)
     t0 = time.perf_counter()
     for _ in range(n_runs):
-        fn(*args)
+        ret = fn(*args)
+        del ret
     _sync_device(dev)
     return (time.perf_counter() - t0) / n_runs
 
@@ -138,6 +153,8 @@ def main(cfg: DictConfig):
     results = {k: [] for k in keys}
     cache_sizes = {k: [] for k in keys}
 
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
+
     # Warmup: use smallest and largest seq_len to cover kernel JIT range
     print("Warming up...")
     for N in [seq_lens[0], seq_lens[-1]]:
@@ -150,23 +167,31 @@ def main(cfg: DictConfig):
             prefill_baseline(model, ids)
         del ids; _free_gpu()
     _sync_device(dev)
-    print("Warmup done.\n")
+    print(f"Warmup done. gpu={_gpu_mb():.0f}MB\n")
 
     for N in seq_lens:
         torch.manual_seed(bb.seed)
         _free_gpu()
+        log.info("=== N=%d  gpu=%.0fMB ===", N, _gpu_mb())
 
         # Per-N warmup
         input_ids = torch.randint(0, config.vocab_size, (1, N))
         prefill_baseline(model, input_ids)
         _free_gpu()
+        log.info("  after warmup: gpu=%.0fMB", _gpu_mb())
 
-        # Capture checkpoints — offload each to CPU immediately
+        # Capture checkpoints — stored on CPU inside prefill_and_capture_at
         input_ids = torch.randint(0, config.vocab_size, (1, N))
+        log.info("  capturing log ckpts...")
         log_store = prefill_and_capture_at(model, input_ids, _checkpoint_positions(N))
-        log_store.to("cpu"); _free_gpu()
+        _free_gpu()
+        log.info("  after log capture: gpu=%.0fMB, store=%.1fMB",
+                 _gpu_mb(), log_store.memory_bytes() / 1024**2)
+        log.info("  capturing block ckpts...")
         block_store = prefill_and_capture_at(model, input_ids, _block_positions(N, B))
-        block_store.to("cpu"); _free_gpu()
+        _free_gpu()
+        log.info("  after block capture: gpu=%.0fMB, store=%.1fMB",
+                 _gpu_mb(), block_store.memory_bytes() / 1024**2)
 
         # Cache sizes (bytes) — computed on CPU tensors, same values
         kv_bytes = sum(t.nelement() * t.element_size() for s in [log_store]
@@ -180,38 +205,56 @@ def main(cfg: DictConfig):
         log_ckpt = log_store.best_checkpoint(N)
         block_ckpt = block_store.best_checkpoint(N)
 
+        torch.cuda.reset_peak_memory_stats()
+
         # 1. No cache
+        log.info("  timing no_cache... gpu=%.0fMB", _gpu_mb())
         t_no_cache = _time(n_runs, dev, prefill_baseline, model, input_ids)
-        _free_gpu()
+        log.info("    peak=%.0fMB", torch.cuda.max_memory_allocated() / 1024**2)
+        _free_gpu(); torch.cuda.reset_peak_memory_stats()
 
         # 2. Attention-only KV cache = skip attention layers, keep GDN+FFN
+        log.info("  timing attn_only... gpu=%.0fMB", _gpu_mb())
         with disable_attention_layers(model):
             t_attn_only = _time(n_runs, dev, prefill_baseline, model, input_ids)
-        _free_gpu()
+        log.info("    peak=%.0fMB", torch.cuda.max_memory_allocated() / 1024**2)
+        _free_gpu(); torch.cuda.reset_peak_memory_stats()
 
         t_attn_cost = max(t_no_cache - t_attn_only, 0)
 
         # 3. Block hybrid + attention: resume from block boundary, full pipeline
+        log.info("  timing block+attn... gpu=%.0fMB", _gpu_mb())
         block_store.to(dev)
+        log.info("    block_store on gpu: %.0fMB", _gpu_mb())
         t_block_and_attn = _time(n_runs, dev, prefill_from_checkpoint, model, input_ids, block_store)
-        _free_gpu()
+        log.info("    peak=%.0fMB", torch.cuda.max_memory_allocated() / 1024**2)
+        _free_gpu(); torch.cuda.reset_peak_memory_stats()
 
         # 5. Block (no attn) = GDN-only for remaining tokens + attention cost for all N
+        log.info("  timing block_gdn... gpu=%.0fMB", _gpu_mb())
+        block_store.to(dev)
         with disable_attention_layers(model):
             t_block_gdn = _time(n_runs, dev, prefill_from_checkpoint, model, input_ids, block_store)
         t_block = t_block_gdn + t_attn_cost
-        block_store.to("cpu"); _free_gpu()
+        log.info("    peak=%.0fMB", torch.cuda.max_memory_allocated() / 1024**2)
+        block_store.to("cpu"); _free_gpu(); torch.cuda.reset_peak_memory_stats()
 
         # 4. Logarithmic + attention: resume from 2^i, full pipeline
+        log.info("  timing log+attn... gpu=%.0fMB", _gpu_mb())
         log_store.to(dev)
+        log.info("    log_store on gpu: %.0fMB", _gpu_mb())
         t_log_and_attn = _time(n_runs, dev, prefill_from_checkpoint, model, input_ids, log_store)
-        _free_gpu()
+        log.info("    peak=%.0fMB", torch.cuda.max_memory_allocated() / 1024**2)
+        _free_gpu(); torch.cuda.reset_peak_memory_stats()
 
         # 6. Log (no attn) = GDN-only for remaining tokens + attention cost for all N
+        log.info("  timing log_gdn... gpu=%.0fMB", _gpu_mb())
+        log_store.to(dev)
         with disable_attention_layers(model):
             t_log_gdn = _time(n_runs, dev, prefill_from_checkpoint, model, input_ids, log_store)
         t_log = t_log_gdn + t_attn_cost
-        log_store.to("cpu"); _free_gpu()
+        log.info("    peak=%.0fMB", torch.cuda.max_memory_allocated() / 1024**2)
+        log_store.to("cpu"); _free_gpu(); torch.cuda.reset_peak_memory_stats()
 
         for k, v in zip(keys, [t_no_cache, t_attn_only, t_block, t_log, t_block_and_attn, t_log_and_attn]):
             results[k].append(v)
