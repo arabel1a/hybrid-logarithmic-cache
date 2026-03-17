@@ -5,7 +5,7 @@ model:
   gdn_layers: 3
   ga_layers: 1
   # HF-compatible fields (for checkpoint_cache.py, single layer group)
-  vocab_size: 248044        # real Qwen3.5 vocab size
+  vocab_size: 512        # for original qwen vocab, most logits take too much memory
   hidden_size: 1024         # = d
   intermediate_size: 3584   # = d_ff
   num_hidden_layers: 4      # 1 group = 3 GDN + 1 attn
@@ -20,7 +20,8 @@ model:
   max_position_embeddings: 262144
   rope_theta: 10000000.0
 
-device: mps  # cpu, cuda, mps
+device: cuda  # cpu, cuda, mps
+dtype: float16  # cpu, cuda, mps
 
 test:
   seq_len: 100

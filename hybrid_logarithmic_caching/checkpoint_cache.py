@@ -10,6 +10,8 @@ implementation always passes initial_state=None during prefill (seq_len > 1).
 Our patch passes the cached recurrent_state when available.
 """
 
+import os
+
 import math
 import time
 from dataclasses import dataclass, field
@@ -387,17 +389,40 @@ def make_model_config(cfg) -> Qwen3_5TextConfig:
         linear_num_key_heads=cfg.model.linear_num_key_heads,
         linear_num_value_heads=cfg.model.linear_num_value_heads,
         max_position_embeddings=cfg.model.max_position_embeddings,
+        torch_dtype=cfg.dtype,
         rope_parameters={"rope_type": "default", "rope_theta": cfg.model.rope_theta},
     )
 
-
 def make_model(cfg) -> Qwen3_5TextModel:
     model_config = make_model_config(cfg)
+    fa_failed=False
+    try:
+        import flash_attn
+        model_config.update("attn_implementation", "flash_attention_2")
+    except Exception:
+        print("failed to flash_attention_2")
+        fa_failed=True
+
+    # --- construct model (DO NOT pass attn_implementation here) ---
     model = Qwen3_5TextModel(model_config).eval()
+
+    # --- fallback if flash attention is not actually usable ---
+    if fa_failed and cfg.device == "cuda":
+        print("using xformers")
+        from torch.nn.attention import sdpa_kernel, SDPBackend
+        xformers_backend = SDPBackend.EFFICIENT_ATTENTION
+        
+        def wrapped_forward(orig_forward):
+            def new_forward(*args, **kwargs):
+                with sdpa_kernel(xformers_backend):
+                    return orig_forward(*args, **kwargs)
+            return new_forward
+
+        model.forward = wrapped_forward(model.forward)
+
+
     model.to(cfg.device)
     return model
-
-
 # ---------------------------------------------------------------------------
 # Correctness test - differences in attention outputs
 # ---------------------------------------------------------------------------
