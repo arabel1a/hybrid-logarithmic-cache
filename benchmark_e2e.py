@@ -51,12 +51,12 @@ the realistic total, since attention must still recompute all N tokens (no KV).
 
 **Walltime vs reported time:**
 On cache hits the strategy must re-capture checkpoints for the new (longer)
-sequence. This should be done with similar time to just forward pass 
-through the rest of the sequence. That's why I measure just a forward time. 
+sequence. This should be done with similar time to just forward pass
+through the rest of the sequence. That's why I measure just a forward time.
 
-Current kernels does not allow to e.g. extract GDN intermediate states. Instead, 
+Current kernels does not allow to e.g. extract GDN intermediate states. Instead,
 to update the cache (e.g. in block-boundary strategy) I need to run MANY small
-kernel calls (e.g. for just 16 tokens). This time is NOT included in the reported 
+kernel calls (e.g. for just 16 tokens). This time is NOT included in the reported
 "total_time" (only the inference pass is timed).
 
 
@@ -67,18 +67,21 @@ kernel calls (e.g. for just 16 tokens). This time is NOT included in the reporte
 - Single-request processing (no batching).
 - Random weights (shapes from Qwen3.5-0.8B, single layer group);
   real tokenizer is used for realistic token counts, IDs mapped to model vocab via modulo.
-- Requests arrive randomly (but keeping order within conversations). 
+- Requests arrive randomly (but keeping order within conversations).
 """
 
 import json
+import logging
 import time
-from collections import OrderedDict
+from collections import defaultdict
+from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import torch
 import hydra
+import matplotlib.pyplot as plt
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
@@ -86,84 +89,20 @@ from hybrid_logarithmic_cache.checkpoint_cache import (
     apply_patch,
     make_model,
     prefill_baseline,
-    prefill_and_capture,
     prefill_from_checkpoint,
-    PrefixCheckpointStore,
     _model_device,
     _sync_device,
     _checkpoint_positions,
 )
-from contextlib import nullcontext
-import matplotlib.pyplot as plt
-from benchmark_baselines import prefill_and_capture_at, _block_positions, disable_attention_layers
+from hybrid_logarithmic_cache.utils import (
+    setup_output_dir,
+    block_positions,
+    prefill_and_capture_at,
+    disable_attention_layers,
+    PrefixCache,
+)
 
-
-# ---------------------------------------------------------------------------
-# Truncate store to fit budget: drop GDN checkpoints from the smallest
-# positions first until the store fits.  KV cache is never dropped since
-# it is shared by all strategies that use caching.
-# ---------------------------------------------------------------------------
-def _truncate_store(store, budget_bytes):
-    """Remove GDN checkpoints (smallest positions first) until store fits in budget.
-    Returns (store, new_size) or (None, 0) if even KV-only exceeds budget."""
-    size = store.memory_bytes()
-    if size <= budget_bytes:
-        return store, size
-    # Drop checkpoints smallest-first
-    positions = sorted(store.checkpoints.keys())
-    for pos in positions:
-        ckpt = store.checkpoints.pop(pos)
-        for t in ckpt.recurrent_states.values():
-            size -= t.nelement() * t.element_size()
-        for t in ckpt.conv_states.values():
-            size -= t.nelement() * t.element_size()
-        if size <= budget_bytes:
-            return store, size
-    # KV-only still too big
-    if size > budget_bytes:
-        return None, 0
-    return store, size
-
-
-# ---------------------------------------------------------------------------
-# Simple FIFO cache with memory budget
-# ---------------------------------------------------------------------------
-class PrefixCache:
-    def __init__(self, budget_bytes):
-        self.budget = budget_bytes
-        self.used = 0
-        self.entries = OrderedDict()  # key -> (store, size_bytes)
-
-    def get(self, key):
-        if key in self.entries:
-            return self.entries[key][0]
-        return None
-
-    def find_best_prefix(self, conv_id, n_turns):
-        """Find the longest cached prefix for this conversation with <= n_turns."""
-        best = None
-        best_turns = 0
-        for t in range(n_turns, 0, -1):
-            k = (conv_id, t)
-            if k in self.entries:
-                return self.entries[k][0], t
-        return None, 0
-
-    def put(self, key, store, size_bytes):
-        if size_bytes > self.budget:
-            store, size_bytes = _truncate_store(store, self.budget)
-            if store is None:
-                return
-        # Evict oldest until we have room
-        while self.used + size_bytes > self.budget and self.entries:
-            _, (_, evicted_size) = self.entries.popitem(last=False)
-            self.used -= evicted_size
-        self.entries[key] = (store, size_bytes)
-        self.used += size_bytes
-
-    @property
-    def n_entries(self):
-        return len(self.entries)
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -181,8 +120,8 @@ def build_requests(cfg):
     df = df[df['url'].isin(longest)]
 
     print(f"total {df['plain_text'].apply(lambda x: len(str(x))).sum()} chars")
-    
-    
+
+
     # Build prefix requests
     requests = []  # list of (conv_id, n_turns, token_text)
     for conv_id in df['url'].unique():
@@ -213,13 +152,13 @@ def tokenize_requests(requests, vocab_size, tokenizer_name="Qwen/Qwen3.5-0.8B", 
     tokenized = []
     last_len = {}
     for conv_id, n_turns, text in requests:
-        # truncation may result in strange situations where I have several exactly same prompts 
+        # truncation may result in strange situations where I have several exactly same prompts
         # in my request (if non-last round exceeds the len). This patch avoids that:
         if last_len.get(conv_id,0) >= max_seq_len:
             continue
         enc = tokenizer(
-                text, 
-                add_special_tokens=False, 
+                text,
+                add_special_tokens=False,
                 return_tensors="pt",
                 max_length=max_seq_len,
                 truncation=True,
@@ -287,7 +226,7 @@ def simulate(model, requests, strategy, cache_budget, block_size=16, progress=Fa
             cached_store, cached_turns = cache.find_best_prefix(conv_id, n_turns)
 
             if strategy in ("block_and_attn", "block"):
-                ckpt_positions = _block_positions(seq_len, block_size)
+                ckpt_positions = block_positions(seq_len, block_size)
             else:  # log_and_attn / log
                 ckpt_positions = _checkpoint_positions(seq_len)
 
@@ -348,8 +287,9 @@ def simulate(model, requests, strategy, cache_budget, block_size=16, progress=Fa
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
-@hydra.main(config_path="conf", config_name="config", version_base=None)
+@hydra.main(config_path="conf", config_name="config", version_base="1.3")
 def main(cfg: DictConfig):
+    out_dir = setup_output_dir(cfg)
     apply_patch()
     model = make_model(cfg)
     dev = _model_device(model)
@@ -365,7 +305,6 @@ def main(cfg: DictConfig):
 
 
     # Interleave conversations randomly, but keep turn order within each conversation.
-    from collections import defaultdict
     by_conv = defaultdict(list)
     for req in tokenized:
         by_conv[req[0]].append(req)
@@ -460,15 +399,12 @@ def main(cfg: DictConfig):
         print(f"{strat:<20} {r['total_time']:>10.1f} {speedup:>7.2f}x {hit_rate:>9.1f}% {tok_saved:>9.1f}%")
 
     # Save per-request logs
-    out_dir = Path(e2e.get("output_dir", "outputs"))
-    plots_path = Path(e2e.boxplots)
-    out_dir.mkdir(parents=True, exist_ok=True)
     for strat in report:
         out_path = out_dir / f"e2e_{strat}.jsonl"
         with open(out_path, "w") as f:
             for entry in results[strat]["per_request"]:
                 f.write(json.dumps(entry) + "\n")
-    print(f"\nPer-request logs saved to {out_dir}/e2e_*.jsonl")
+    log.info("Per-request logs saved to %s/e2e_*.jsonl", out_dir)
 
     # --- Boxplots ---
     labels = {
@@ -532,8 +468,9 @@ def main(cfg: DictConfig):
     ax2.grid(True, alpha=0.3, axis="y")
 
     plt.tight_layout()
-    plt.savefig(plots_path, dpi=200, bbox_inches="tight")
-    print(f"Saved boxplots to {plots_path}")
+    boxplots_path = out_dir / "e2e_boxplots.png"
+    plt.savefig(boxplots_path, dpi=200, bbox_inches="tight")
+    log.info("Saved boxplots to %s", boxplots_path)
 
     # --- Time vs context length ---
     fig2, (ax3, ax4) = plt.subplots(1, 2, figsize=(16, 6))
@@ -541,7 +478,6 @@ def main(cfg: DictConfig):
     for s in report:
         seq_lens = np.array([e["seq_len"] for e in results[s]["per_request"]])
         t_ms = times_ms[s]
-        order = np.argsort(seq_lens)
         ax3.scatter(seq_lens, t_ms, s=6, alpha=0.3, color=colors[s], label=labels[s])
 
     ax3.set_xlabel("Context length (tokens)")
@@ -567,7 +503,7 @@ def main(cfg: DictConfig):
     plt.tight_layout()
     scatter_path = out_dir / "e2e_time_vs_length.png"
     plt.savefig(scatter_path, dpi=200, bbox_inches="tight")
-    print(f"Saved time-vs-length to {scatter_path}")
+    log.info("Saved time-vs-length to %s", scatter_path)
 
 
 if __name__ == "__main__":

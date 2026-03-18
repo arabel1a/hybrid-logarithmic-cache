@@ -1,0 +1,225 @@
+"""Shared utilities for benchmark scripts.
+
+Everything that benchmark_baselines.py and benchmark_e2e.py both need
+lives here so the scripts stay independent of each other.
+"""
+import gc
+import logging
+import time
+from collections import OrderedDict
+from contextlib import contextmanager
+from pathlib import Path
+
+import torch
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+
+from hybrid_logarithmic_cache.checkpoint_cache import (
+    PrefixCheckpointStore,
+    RecurrentCheckpoint,
+    _model_device,
+    _get_linear_layers,
+    _get_attention_layers,
+    _sync_device,
+)
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Output directory & logging
+# ---------------------------------------------------------------------------
+def setup_output_dir(cfg):
+    """Create output dir and configure file + console logging. Returns Path.
+
+    Uses hydra's run dir as default when cfg.output_dir is not set.
+    Hydra itself saves its config snapshot via output_subdir in config.yaml.
+    """
+    from hydra.core.hydra_config import HydraConfig
+
+    if cfg.output_dir:
+        out_dir = Path(cfg.output_dir)
+    else:
+        out_dir = Path(HydraConfig.get().runtime.output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    level = getattr(logging, cfg.get("log_level", "INFO").upper(), logging.INFO)
+
+    file_handler = logging.FileHandler(out_dir / "run.log")
+    file_handler.setLevel(level)
+    file_handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(level)
+    console_handler.setFormatter(logging.Formatter("%(message)s"))
+    root = logging.getLogger()
+    root.setLevel(level)
+    root.addHandler(file_handler)
+    root.addHandler(console_handler)
+    return out_dir
+
+
+# ---------------------------------------------------------------------------
+# GPU helpers
+# ---------------------------------------------------------------------------
+def gpu_mb():
+    return torch.cuda.memory_allocated() / 1024**2
+
+
+def free_gpu():
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# ---------------------------------------------------------------------------
+# Timing helper
+# ---------------------------------------------------------------------------
+def time_fn(n_runs, dev, fn, *args):
+    _sync_device(dev)
+    t0 = time.perf_counter()
+    for _ in range(n_runs):
+        ret = fn(*args)
+        del ret
+    _sync_device(dev)
+    return (time.perf_counter() - t0) / n_runs
+
+
+# ---------------------------------------------------------------------------
+# Checkpoint position helpers
+# ---------------------------------------------------------------------------
+def block_positions(seq_len, block_size):
+    return list(range(block_size, seq_len + 1, block_size))
+
+
+# ---------------------------------------------------------------------------
+# Prefill with capture at arbitrary positions
+# ---------------------------------------------------------------------------
+def prefill_and_capture_at(model, input_ids, ckpt_positions):
+    """Run prefill capturing GDN+conv states and attention KV at specified positions.
+
+    Checkpoints are moved to CPU immediately after cloning to avoid
+    accumulating all of them on GPU (block-B=16 at 32K = 2048 ckpts ≈ 3.3GB).
+    """
+    device = _model_device(model)
+    input_ids = input_ids.to(device)
+    seq_len = input_ids.shape[1]
+    config = model.config
+    linear_layers = _get_linear_layers(config)
+    attn_layers = _get_attention_layers(config)
+
+    ckpt_positions = sorted(set(p for p in ckpt_positions if 0 < p <= seq_len))
+    store = PrefixCheckpointStore(prefix_tokens=input_ids.clone().cpu())
+    boundaries = sorted(set([0] + ckpt_positions + [seq_len]))
+
+    log.info("capture %d ckpts for seq_len=%d, boundaries=%d segments, gpu=%.0fMB",
+             len(ckpt_positions), seq_len, len(boundaries) - 1, gpu_mb())
+
+    cache = Qwen3_5DynamicCache(config=config)
+    for i in range(len(boundaries) - 1):
+        start, end = boundaries[i], boundaries[i + 1]
+        with torch.no_grad():
+            out = model(
+                input_ids=input_ids[:, start:end],
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=torch.arange(start, end, device=device),
+            )
+        cache = out.past_key_values
+
+        if end in ckpt_positions:
+            store.checkpoints[end] = RecurrentCheckpoint(
+                position=end,
+                recurrent_states={
+                    li: cache.recurrent_states[li].clone().cpu()
+                    for li in linear_layers if cache.recurrent_states[li] is not None
+                },
+                conv_states={
+                    li: cache.conv_states[li].clone().cpu()
+                    for li in linear_layers if cache.conv_states[li] is not None
+                },
+            )
+
+    log.info("capture done, cloning KV, gpu=%.0fMB", gpu_mb())
+    for li in attn_layers:
+        if cache.key_cache[li] is not None:
+            store.kv_cache_keys[li] = cache.key_cache[li].clone().cpu()
+            store.kv_cache_values[li] = cache.value_cache[li].clone().cpu()
+    return store
+
+
+# ---------------------------------------------------------------------------
+# Attention layer disabler (context manager)
+# ---------------------------------------------------------------------------
+@contextmanager
+def disable_attention_layers(model):
+    """Skip attention decoder layers entirely (pass-through)."""
+    attn_layers = _get_attention_layers(model.config)
+    saved = {}
+
+    def _identity(hidden_states, *args, **kwargs):
+        return hidden_states
+
+    for li in attn_layers:
+        saved[li] = model.layers[li].forward
+        model.layers[li].forward = _identity
+    try:
+        yield
+    finally:
+        for li, fn in saved.items():
+            model.layers[li].forward = fn
+
+
+# ---------------------------------------------------------------------------
+# FIFO prefix cache with memory budget
+# ---------------------------------------------------------------------------
+def _truncate_store(store, budget_bytes):
+    """Remove GDN checkpoints (smallest positions first) until store fits in budget.
+    Returns (store, new_size) or (None, 0) if even KV-only exceeds budget."""
+    size = store.memory_bytes()
+    if size <= budget_bytes:
+        return store, size
+    positions = sorted(store.checkpoints.keys())
+    for pos in positions:
+        ckpt = store.checkpoints.pop(pos)
+        for t in ckpt.recurrent_states.values():
+            size -= t.nelement() * t.element_size()
+        for t in ckpt.conv_states.values():
+            size -= t.nelement() * t.element_size()
+        if size <= budget_bytes:
+            return store, size
+    if size > budget_bytes:
+        return None, 0
+    return store, size
+
+
+class PrefixCache:
+    def __init__(self, budget_bytes):
+        self.budget = budget_bytes
+        self.used = 0
+        self.entries = OrderedDict()  # key -> (store, size_bytes)
+
+    def get(self, key):
+        if key in self.entries:
+            return self.entries[key][0]
+        return None
+
+    def find_best_prefix(self, conv_id, n_turns):
+        """Find the longest cached prefix for this conversation with <= n_turns."""
+        for t in range(n_turns, 0, -1):
+            k = (conv_id, t)
+            if k in self.entries:
+                return self.entries[k][0], t
+        return None, 0
+
+    def put(self, key, store, size_bytes):
+        if size_bytes > self.budget:
+            store, size_bytes = _truncate_store(store, self.budget)
+            if store is None:
+                return
+        while self.used + size_bytes > self.budget and self.entries:
+            _, (_, evicted_size) = self.entries.popitem(last=False)
+            self.used -= evicted_size
+        self.entries[key] = (store, size_bytes)
+        self.used += size_bytes
+
+    @property
+    def n_entries(self):
+        return len(self.entries)

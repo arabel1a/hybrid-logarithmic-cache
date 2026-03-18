@@ -30,5 +30,3 @@ plot_benchmark:
   seq_lens: [1023, 1024, 1536, 2047, 2048, 3072, 4095, 4096]
   output: assets/empirical_latency_and_cache_27b.png
 
-benchmark_e2e:
-  output_dir: outputs/27b
