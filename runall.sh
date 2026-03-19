@@ -1,5 +1,9 @@
+set -e
+
 uv sync
-uv run python plot_flops_cache.py 
-uv run python plot_flops_cache.py --config-name config_27b.yaml
-uv run python benchmark_baselines.py 
-uv run python benchmark_e2e.py 
+
+echo "toy run"
+uv run python scripts/prepare_data.py --config-name=toy
+uv run python scripts/benchmark_single.py --config-name=toy
+uv run python scripts/benchmark_e2e.py --config-name=toy
+uv run python scripts/plot_results.py --config-name=toy

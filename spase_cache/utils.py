@@ -1,9 +1,10 @@
 """Shared utilities for benchmark scripts.
 
-Everything that benchmark_baselines.py and benchmark_e2e.py both need
-lives here so the scripts stay independent of each other.
+Everything that benchmark scripts both need lives here
+so the scripts stay independent of each other.
 """
 import gc
+import json
 import logging
 import time
 from collections import OrderedDict
@@ -11,15 +12,12 @@ from contextlib import contextmanager
 from pathlib import Path
 
 import torch
-from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
+from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache, Qwen3_5TextModel
 
-from hybrid_logarithmic_cache.checkpoint_cache import (
+from spase_cache.checkpoint_cache import (
     PrefixCheckpointStore,
     RecurrentCheckpoint,
-    _model_device,
-    _get_linear_layers,
-    _get_attention_layers,
-    _sync_device,
 )
 
 log = logging.getLogger(__name__)
@@ -56,17 +54,122 @@ def setup_output_dir(cfg):
     root.addHandler(console_handler)
     return out_dir
 
+def _save_jsonl(path, entries):
+    with open(path, "w") as f:
+        for entry in entries:
+            f.write(json.dumps(entry) + "\n")
+
+
 
 # ---------------------------------------------------------------------------
 # GPU helpers
 # ---------------------------------------------------------------------------
 def gpu_mb():
-    return torch.cuda.memory_allocated() / 1024**2
-
+    if torch.cuda.is_available():
+        return torch.cuda.memory_allocated() / 1024**2
+    return 0.0
 
 def free_gpu():
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def reset_peak_memory():
+    if torch.cuda.is_available():
+        torch.cuda.reset_peak_memory_stats()
+
+def _sync_device(dev: torch.device):
+    if dev.type == "cuda":
+        torch.cuda.synchronize()
+    elif dev.type == "mps":
+        torch.mps.synchronize()
+
+# ---------------------------------------------------------------------------
+# Model helpers
+# ---------------------------------------------------------------------------
+def _model_device(model: Qwen3_5TextModel) -> torch.device:
+    return next(model.parameters()).device
+
+
+def _get_linear_layers(config: Qwen3_5TextConfig) -> list[int]:
+    return [i for i, lt in enumerate(config.layer_types) if lt == "linear_attention"]
+
+
+def _get_attention_layers(config: Qwen3_5TextConfig) -> list[int]:
+    return [i for i, lt in enumerate(config.layer_types) if lt == "full_attention"]
+
+
+def make_model_config(cfg) -> Qwen3_5TextConfig:
+    return Qwen3_5TextConfig(
+        vocab_size=cfg.model.vocab_size,
+        hidden_size=cfg.model.hidden_size,
+        intermediate_size=cfg.model.intermediate_size,
+        num_hidden_layers=cfg.model.num_hidden_layers,
+        num_attention_heads=cfg.model.num_attention_heads,
+        num_key_value_heads=cfg.model.num_key_value_heads,
+        head_dim=cfg.model.head_dim,
+        linear_conv_kernel_dim=cfg.model.linear_conv_kernel_dim,
+        linear_key_head_dim=cfg.model.linear_key_head_dim,
+        linear_value_head_dim=cfg.model.linear_value_head_dim,
+        linear_num_key_heads=cfg.model.linear_num_key_heads,
+        linear_num_value_heads=cfg.model.linear_num_value_heads,
+        max_position_embeddings=cfg.model.max_position_embeddings,
+        torch_dtype=cfg.dtype,
+        rope_parameters={"rope_type": "default", "rope_theta": cfg.model.rope_theta},
+    )
+
+def make_model(cfg) -> Qwen3_5TextModel:
+    model_config = make_model_config(cfg)
+    model = Qwen3_5TextModel(model_config).eval()
+    model.set_attn_implementation("sdpa")
+    model.to(cfg.device)
+    return model
+
+
+# ---------------------------------------------------------------------------
+# Chunked prefill
+#
+# HF materializes a full causal mask when Q_len != K_len. For large contexts
+# it is very spacy -- (Q_len × K_len × 4B). Chunking keeps the mask small.
+#
+#
+# Also chunked prefill is closer to real serving systems than prefilling
+# everything at once; for systems like vLLM it allows efficient interleaving
+# of prefill and decode requests in continuous batching.
+# ---------------------------------------------------------------------------
+def chunked_prefill(
+    model: Qwen3_5TextModel,
+    input_ids: torch.Tensor,
+    resume_pos,
+    cache,
+    max_chunk: int = 4096,
+) -> tuple[torch.Tensor, Qwen3_5DynamicCache]:
+
+    device = _model_device(model)
+    input_ids = input_ids.to(device)
+    seq_len = input_ids.shape[1]
+    pos = resume_pos
+    output = None
+    while pos < seq_len:
+        end = min(pos + max_chunk, seq_len)
+        with torch.no_grad():
+            output = model(
+                input_ids=input_ids[:, pos:end],
+                past_key_values=cache,
+                use_cache=True,
+                cache_position=torch.arange(pos, end, device=device),
+            )
+        cache = output.past_key_values
+        pos = end
+    return output.last_hidden_state, cache
+
+def prefill_baseline(model, input_ids):
+    return chunked_prefill(model, input_ids, 0, Qwen3_5DynamicCache(config=model.config))
+
+def warmup(model, N):
+    dev = _model_device(model)
+    ids = torch.randint(0, model.config.vocab_size, (1, N)).to(dev)
+    prefill_baseline(model, ids)
 
 
 # ---------------------------------------------------------------------------
@@ -80,14 +183,6 @@ def time_fn(n_runs, dev, fn, *args):
         del ret
     _sync_device(dev)
     return (time.perf_counter() - t0) / n_runs
-
-
-# ---------------------------------------------------------------------------
-# Checkpoint position helpers
-# ---------------------------------------------------------------------------
-def block_positions(seq_len, block_size):
-    return list(range(block_size, seq_len + 1, block_size))
-
 
 # ---------------------------------------------------------------------------
 # Prefill with capture at arbitrary positions

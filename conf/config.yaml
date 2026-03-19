@@ -1,8 +1,22 @@
 output_dir: null  # set via CLI, or defaults to hydra's timestamped dir
-log_level: INFO   # DEBUG, INFO, WARNING, ERROR
+log_level: WARNING   # DEBUG, INFO, WARNING, ERROR
+
+device: mps  # cpu, cuda, mps
+dtype: float16  # enable 2080's tensor cores
+seed: 42
 
 hydra:
   output_subdir: hydra  # saves hydra config into ${output_dir}/hydra/
+
+data:
+  raw_path: data/chatgpt_results_final_language_filtered.csv
+  processed: data/tokenized.parquet
+  max_seq_len: 16384 # maximum request length 
+  max_rounds: 36 # there are few sequences of very many rounds (up to 800), which bloats the number of requests (quadratic amount of total token). I filter 95th percentile
+  max_rows: 1000000
+ 
+baseline:
+  block_size: 128 # block size for dense caching
 
 # Qwen3.5-0.8B dimensions
 model:
@@ -26,39 +40,22 @@ model:
   max_position_embeddings: 262144
   rope_theta: 10000000.0
 
-baseline:
-  block_size: 128
-
-device: cuda  # cpu, cuda, mps
-dtype: float16  # allows to make use of my 2080's tensorcores
-
 test:
   seq_len: 100
-  seed: 42
   tolerance: 1.0e-3
-
-profile:
-  seq_len: 1023
-  seed: 42
-  trace_dir: traces
-  n_warmup: 2
-  n_active: 3
-  record_shapes: true
-  profile_memory: true
-  with_stack: true
-  profiler_row_limit: 15
 
 benchmark_baselines:
   seq_lens: [1023, 1024, 1536, 2047, 2048, 3072, 4095, 4096, 6144, 8191, 8192, 16383, 16384, 32767, 32768]
-  block_size: 128
+  strategies: [no_cache, block, log]
   n_runs: 3
-  seed: 42
 
 benchmark_e2e:
-  data_path: data/chatgpt_results_final_language_filtered.csv
-  n_conversations: 100
-  max_seq_len: 16384
-  max_rounds: 50 # there are few very long sequences, which bloats the number of requests
-  cache_budget_gb: 1.0
-  seed: 42
-  progress: False
+  strategies: [no_cache, block, log]
+  cache_budget_gb: 4.0
+  progress: true
+
+overlap_distribution:
+  batch_size: 5000
+
+plot:
+  _target_: plot_results.plot_all  # or plot_results.plot_overlap, plot_results.plot_baselines, etc.
