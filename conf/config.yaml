@@ -1,4 +1,4 @@
-run_name: debug
+run_name: full
 output_dir: outputs/${run_name}
 overwrite: False
 log_level: WARNING   # DEBUG, INFO, WARNING, ERROR
@@ -67,3 +67,22 @@ prepare_data:
 
 plot_results:
   _target_: plot_results.plot_all  # or plot_results.plot_overlap, plot_results.plot_baselines, etc.
+  no_cache:      
+     - 'No caching'
+     - 'black'
+     - 'o' 
+     - '-'
+     - 2
+  block:
+    - 'No caching'
+    - 'black'
+    - 'o' 
+    - '-'
+    - 2
+
+  log:
+    - 'No caching'
+    - 'black'
+    - 'o' 
+    - '-'
+    - 2

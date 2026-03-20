@@ -4,6 +4,7 @@ Everything that benchmark scripts both need lives here
 so the scripts stay independent of each other.
 """
 import gc
+import shutil
 import json
 import logging
 import time
@@ -41,8 +42,11 @@ def setup_output_dir(cfg, task: str):
     root_dir.mkdir(parents=True, exist_ok=True)
 
     out_dir = root_dir / task
-    if not cfg.get("overwrite", True) and out_dir.exists():
-        raise FileExistsError(f"Output dir already exists and overwrite=False: {out_dir}")
+    if out_dir.exists():
+        if not cfg.get("overwrite", True): 
+            raise FileExistsError(f"Output dir already exists and overwrite=False: {out_dir}")
+        else:
+             shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     level = getattr(logging, cfg.get("log_level", "INFO").upper(), logging.INFO)

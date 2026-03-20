@@ -116,30 +116,30 @@ def prefill_from_checkpoint(
         cache = Qwen3_5DynamicCache(config=config)
         for li in linear_layers:
             if li in ckpt.recurrent_states:
-                cache.recurrent_states[li] = ckpt.recurrent_states[li].clone()
+                cache.recurrent_states[li] = ckpt.recurrent_states[li].to(device)
             if li in ckpt.conv_states:
-                cache.conv_states[li] = ckpt.conv_states[li].clone()
+                cache.conv_states[li] = ckpt.conv_states[li].to(device)
         for li in attn_layers:
             if li in store.kv_cache_keys:
-                cache.key_cache[li] = store.kv_cache_keys[li][:, :, :seq_len, :].clone()
-                cache.value_cache[li] = store.kv_cache_values[li][:, :, :seq_len, :].clone()
+                cache.key_cache[li] = store.kv_cache_keys[li][:, :, :seq_len, :].to(device)
+                cache.value_cache[li] = store.kv_cache_values[li][:, :, :seq_len, :].to(device)
         dummy = torch.zeros(1, 1, config.hidden_size, device=device)
         return dummy, cache
 
     # Verify token match
-    assert torch.equal(store.prefix_tokens[0, :resume_pos], input_ids[0, :resume_pos])
+    assert torch.equal(store.prefix_tokens[0, :resume_pos], input_ids[0, :resume_pos].cpu())
 
-    # Build cache with restored states
+    # Build cache with restored states (moves tensors to model device)
     cache = Qwen3_5DynamicCache(config=config)
     for li in linear_layers:
         if li in ckpt.recurrent_states:
-            cache.recurrent_states[li] = ckpt.recurrent_states[li].clone()
+            cache.recurrent_states[li] = ckpt.recurrent_states[li].to(device)
         if li in ckpt.conv_states:
-            cache.conv_states[li] = ckpt.conv_states[li].clone()
+            cache.conv_states[li] = ckpt.conv_states[li].to(device)
     for li in attn_layers:
         if li in store.kv_cache_keys:
-            cache.key_cache[li] = store.kv_cache_keys[li][:, :, :resume_pos, :].clone()
-            cache.value_cache[li] = store.kv_cache_values[li][:, :, :resume_pos, :].clone()
+            cache.key_cache[li] = store.kv_cache_keys[li][:, :, :resume_pos, :].to(device)
+            cache.value_cache[li] = store.kv_cache_values[li][:, :, :resume_pos, :].to(device)
 
 
     # Process remaining tokens

@@ -27,10 +27,8 @@ log = logging.getLogger(__name__)
 LINE_SPECS = {
     'no_cache':      ('No caching',             'black',      'o', '-',  2),
     'attn_only':     ('Attention-only KV cache', 'tab:red',    's', '-',  2),
-    'block':         ('Block hybrid',            'tab:blue',   '^', '-',  1.5),
-    'log':           ('Logarithmic',             'tab:orange', 'v', '-',  2),
-    'block_and_attn':('Attention + Block hybrid','tab:green',  'D', '-',  2),
-    'log_and_attn':  ('Attention + Logarithmic', 'tab:purple', 'p', '-',  2),
+    'block':         ('Block + KV cache',        'tab:blue',   '^', '-',  1.5),
+    'log':           ('Logarithmic + KV cache',  'tab:orange', 'v', '-',  2),
 }
 
 
@@ -56,6 +54,7 @@ def plot_baselines(out_dir, root_dir=None, **_kw):
     seq_lens = data["seq_lens"]
     B = data["block_size"]
     strategies = data["strategies"]
+    print(strategies)
     m = data["model_params"]
     model_name = data["model_name"]
 
@@ -77,16 +76,22 @@ def plot_baselines(out_dir, root_dir=None, **_kw):
     flop_ga_linear = flop_ffn / n_layers + flop_ga_proj
     flop_gdn_recompute = flop_ffn * gdn_per_group / n_layers + flop_gdn_proj + flop_gdn_rec
 
+    # Theoretical FLOPs per strategy.
+    # All checkpoint strategies assume KV cache is always stored alongside GDN
+    # checkpoints, since without KV the GA layer needs hidden states from GDN
+    # FFNs and we cannot skip any GDN compute for the prefix.
+    flop_per_tok = flop_ga_linear + flop_gdn_recompute
+
+    # Tail tokens: tokens after the best checkpoint that must be recomputed
+    n_tail_block = N_arr % B
+    n_tail_log = N_arr - 2.0 ** np.floor(np.log2(N_arr))
+
     theo = {}
-    theo['no_cache'] = N_arr * (flop_ga_linear + flop_gdn_recompute) + N_arr**2 * flop_ga_quad_per_tok
+    theo['no_cache'] = N_arr * flop_per_tok + N_arr**2 * flop_ga_quad_per_tok
     theo['attn_only'] = N_arr * flop_gdn_recompute
-    saved_attn = N_arr**2 * flop_ga_quad_per_tok + N_arr * flop_ga_linear
-    saved_block = (N_arr - N_arr % B) * flop_gdn_recompute
-    saved_log = (2.0 ** np.floor(np.log2(N_arr))) * flop_gdn_recompute
-    theo['block'] = theo['no_cache'] - saved_block
-    theo['log'] = theo['no_cache'] - saved_log
-    theo['block_and_attn'] = np.maximum(theo['no_cache'] - saved_attn - saved_block, 0)
-    theo['log_and_attn'] = np.maximum(theo['no_cache'] - saved_attn - saved_log, 0)
+    # block/log: recompute only tail through full model; tail attends to full context
+    theo['block'] = n_tail_block * flop_per_tok + n_tail_block * N_arr * flop_ga_quad_per_tok
+    theo['log'] = n_tail_log * flop_per_tok + n_tail_log * N_arr * flop_ga_quad_per_tok
 
     # Scale theoretical to empirical
     if 'no_cache' in strategies:
@@ -109,10 +114,8 @@ def plot_baselines(out_dir, root_dir=None, **_kw):
     theo_cache = {}
     theo_cache['no_cache'] = np.zeros_like(N_arr)
     theo_cache['attn_only'] = N_arr * attn_kv_per_token
-    theo_cache['block'] = n_block_ckpts * per_ckpt
-    theo_cache['log'] = n_log_ckpts * per_ckpt
-    theo_cache['block_and_attn'] = theo_cache['attn_only'] + theo_cache['block']
-    theo_cache['log_and_attn'] = theo_cache['attn_only'] + theo_cache['log']
+    theo_cache['block'] = N_arr * attn_kv_per_token + n_block_ckpts * per_ckpt
+    theo_cache['log'] = N_arr * attn_kv_per_token + n_log_ckpts * per_ckpt
 
     # --- Plot ---
     to_ms = lambda a: np.array(a) * 1000

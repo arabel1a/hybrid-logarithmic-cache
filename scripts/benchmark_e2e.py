@@ -1,15 +1,13 @@
 """End-to-end prefix caching evaluation on real conversation traces.
 
 Runs checkpoint placement strategies with FIFO prefix cache.
-Attention cost is measured once (no_cache full vs GDN-only) and added
-to checkpoint strategies per-request.
+All checkpoint strategies store both GDN recurrent states and attention KV.
 """
 import spase_cache
 import json
 import logging
 import time
 from collections import defaultdict
-from contextlib import nullcontext
 from pathlib import Path
 
 import numpy as np
@@ -27,7 +25,6 @@ from spase_cache.utils import (
     prefill_baseline,
     _model_device,
     _sync_device,
-    disable_attention_layers,
     prefill_and_capture_at,
     PrefixCache,
     _save_jsonl,
@@ -100,62 +97,59 @@ def interleave(requests, seed):
 
 
 def simulate(model, requests, conv_tokens, vocab_size, strategy, cache_budget,
-             block_size, skip_attention=False, progress=False):
-    """Run all requests through the model with given caching strategy."""
+             block_size, progress=False):
+    """Run all requests through the model with given caching strategy.
+
+    All checkpoint strategies store both GDN recurrent states and attention KV
+    cache, since GDN-only checkpointing cannot skip FFN compute (the GA layer
+    needs hidden states produced by GDN FFNs).
+    """
     dev = _model_device(model)
     uses_cache = strategy != "no_cache"
     cache = PrefixCache(cache_budget) if uses_cache else None
-
-    ctx = disable_attention_layers(model) if skip_attention else nullcontext()
     per_request = []
 
-    with ctx:
-        for conv_id, turn, n_msgs in tqdm(requests, desc=strategy, disable=not progress):
-            all_toks = [t for toks in conv_tokens[conv_id][:n_msgs] for t in toks]
-            input_ids = torch.tensor([all_toks], dtype=torch.long).to(dev) % vocab_size
-            seq_len = input_ids.shape[1]
+    for conv_id, turn, n_msgs in tqdm(requests, desc=strategy, disable=not progress):
+        all_toks = [t for toks in conv_tokens[conv_id][:n_msgs] for t in toks]
+        input_ids = torch.tensor([all_toks], dtype=torch.long).to(dev) % vocab_size
+        seq_len = input_ids.shape[1]
 
-            hit = False
-            tokens_saved = 0
-            cached_store = None
+        hit = False
+        tokens_saved = 0
+        cached_store = None
 
-            if uses_cache:
-                cached_store, _ = cache.find_best_prefix(conv_id, turn)
+        if uses_cache:
+            cached_store, _ = cache.find_best_prefix(conv_id, turn)
 
-            if cached_store is not None:
-                hit = True
-                cached_store.to(dev)
-                _sync_device(dev)
-                t0 = time.perf_counter()
-                prefill_from_checkpoint(model, input_ids, cached_store)
-                _sync_device(dev)
-                dt = time.perf_counter() - t0
-                cached_store.to("cpu")
-                ckpt = cached_store.best_checkpoint(seq_len)
-                if ckpt:
-                    tokens_saved = ckpt.position
-            else:
-                _sync_device(dev)
-                t0 = time.perf_counter()
-                prefill_baseline(model, input_ids)
-                _sync_device(dev)
-                dt = time.perf_counter() - t0
+        if cached_store is not None:
+            hit = True
+            _sync_device(dev)
+            t0 = time.perf_counter()
+            prefill_from_checkpoint(model, input_ids, cached_store)
+            _sync_device(dev)
+            dt = time.perf_counter() - t0
+            ckpt = cached_store.best_checkpoint(seq_len)
+            if ckpt:
+                tokens_saved = ckpt.position
+        else:
+            _sync_device(dev)
+            t0 = time.perf_counter()
+            prefill_baseline(model, input_ids)
+            _sync_device(dev)
+            dt = time.perf_counter() - t0
 
-            # Capture checkpoints for cache
-            if uses_cache:
-                positions = checkpoint_positions(strategy, seq_len, block_size)
-                store = prefill_and_capture_at(model, input_ids, positions)
-                if skip_attention:
-                    store.kv_cache_keys = {}
-                    store.kv_cache_values = {}
-                size = store.memory_bytes()
-                store.to("cpu")
-                cache.put((conv_id, turn), store, size)
+        # Capture checkpoints for cache
+        if uses_cache:
+            positions = checkpoint_positions(strategy, seq_len, block_size)
+            store = prefill_and_capture_at(model, input_ids, positions)
+            size = store.memory_bytes()
+            store.to("cpu")
+            cache.put((conv_id, turn), store, size)
 
-            per_request.append({
-                "conv_id": str(conv_id), "turn": turn, "seq_len": seq_len,
-                "time_s": dt, "hit": hit, "tokens_saved": tokens_saved,
-            })
+        per_request.append({
+            "conv_id": str(conv_id), "turn": turn, "seq_len": seq_len,
+            "time_s": dt, "hit": hit, "tokens_saved": tokens_saved,
+        })
 
     return {
         "total_time": sum(e["time_s"] for e in per_request),
@@ -197,9 +191,6 @@ def main(cfg: DictConfig):
     dummy = torch.randint(0, config.vocab_size, (1, 512)).to(dev)
     for _ in range(3):
         prefill_baseline(model, dummy)
-    with disable_attention_layers(model):
-        for _ in range(3):
-            prefill_baseline(model, dummy)
     _sync_device(dev)
 
     summary = {
@@ -212,49 +203,16 @@ def main(cfg: DictConfig):
     }
     summary_path = out_dir / "e2e_summary.json"
 
-    # Measure per-request attention cost (no_cache full vs GDN-only)
-    has_ckpt_strategies = any(s != "no_cache" for s in strategies)
-    res_full = None
-    attn_costs = None
-
-    if has_ckpt_strategies:
-        log.info("Measuring attention cost (no_cache full vs GDN-only)...")
-        res_full = simulate(model, requests, conv_tokens, vocab_size,
-                            "no_cache", 0, B, skip_attention=False, progress=progress)
-        res_gdn = simulate(model, requests, conv_tokens, vocab_size,
-                           "no_cache", 0, B, skip_attention=True, progress=progress)
-        attn_costs = [
-            max(f["time_s"] - g["time_s"], 0)
-            for f, g in zip(res_full["per_request"], res_gdn["per_request"])
-        ]
-
     for strat in strategies:
         log.info("Strategy: %s", strat)
+        res = simulate(model, requests, conv_tokens, vocab_size,
+                       strat, cache_budget, B, progress=progress)
 
-        if strat == "no_cache":
-            if res_full is not None:
-                res = res_full
-            else:
-                res = simulate(model, requests, conv_tokens, vocab_size,
-                              "no_cache", 0, B, progress=progress)
-        else:
-            # Run with skipped attention, add per-request attn cost
-            res = simulate(model, requests, conv_tokens, vocab_size,
-                           strat, cache_budget, B, skip_attention=True, progress=progress)
-            for i, entry in enumerate(res["per_request"]):
-                entry["time_s"] += attn_costs[i]
-            res["total_time"] = sum(e["time_s"] for e in res["per_request"])
-
-        log.info("  Total time: %.1fs", res["total_time"])
+        log.info("  %s: total=%.1fs", strat, res["total_time"])
         if res["hits"] > 0:
-            log.info("  Cache hits: %d/%d (%.1f%%)",
+            log.info("    hits: %d/%d (%.1f%%)",
                      res["hits"], len(requests), res["hits"] / len(requests) * 100)
-
-        # Save JSONL
-        jsonl_path = out_dir / f"e2e_{strat}.jsonl"
-        _save_jsonl(jsonl_path, res["per_request"])
-
-        # Update summary
+        _save_jsonl(out_dir / f"e2e_{strat}.jsonl", res["per_request"])
         summary["strategies"][strat] = {
             "total_time": res["total_time"],
             "hits": res["hits"],

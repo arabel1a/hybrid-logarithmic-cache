@@ -22,13 +22,13 @@ However, GDN only needs the state at position $t-1$ to produce position $t$ (unl
 
 Balance caching and recomputation by storing states at selected positions:
 
-* **Logarithmic ($2^i$) caching:** Store states at positions $1, 2, 4, 8, \ldots, 2^{\lfloor\log_2 N\rfloor}$. Guarantees reusing $\geq N/2$ tokens of a length-$N$ common prefix (worst case 50%, average ~69%). Cache size: $O(\log L)$ per sequence.
+* **Logarithmic ($2^i$) caching:** Store attention KV + GDN states at positions $1, 2, 4, 8, \ldots, 2^{\lfloor\log_2 N\rfloor}$. Guarantees reusing $\geq N/2$ tokens of a length-$N$ common prefix (worst case 50%, average ~69%). GDN checkpoint overhead: $O(\log L)$ per sequence (on top of the $O(L)$ attention KV that any hybrid cache needs).
 
 > **TODO:** **$\sqrt{N}$ caching:** Store states at $\sqrt{L}$-spaced boundaries. Reduces GDN recomputation from $O(N)$ to $O(\sqrt{N})$ in $O(\sqrt{L})$ memory.
 
 > There seem to be a research gap for principled mass-serving theory to optimally balance checkpoint placement, memory budget, and expected prefix distributions.
 
-Currently vLLM uses $O(L/B)$ checkpoints (linear in sequence length) to eliminate all GDN recomputation. Proposed methods trade some recomputation for asymptotically less memory, leading to higher cache hit rates under fixed memory budgets.
+Currently vLLM uses $O(L/B)$ checkpoints (linear in sequence length) to eliminate all GDN recomputation. Both approaches store attention KV alongside GDN states (KV cache is required — see table below). Logarithmic checkpoints trade some tail recomputation for asymptotically less memory ($O(\log L)$ vs $O(L/B)$ GDN states), leading to higher cache hit rates under fixed memory budgets.
 
 # Case study: Qwen3.5
 
@@ -53,11 +53,13 @@ Since prefill is compute-bound, FLOP is a good proxy for latency. **Per token pe
 
 #### Saved Flop Estimation
 
-| method | compute saved | cache size per layer group per sequence |
+All checkpoint strategies **require** attention KV cache alongside GDN state checkpoints. Without KV cache, the GA layer needs hidden states produced by GDN FFNs, so no GDN computation can be skipped — the GDN recurrence alone is $<1\%$ of per-token cost.
+
+| method | tail tokens to recompute | cache size per layer group per sequence |
 | --- | --- | --- |
-| Only full attention | 1/4 FFN + all GA  | $L \times n_{kv} \times d_a \times 2 $ |
-| Block hybrid cache | ~3/4 FFN + all GDN | $3L \times n_v \times d_h^2 / B$
-| Logarithmic | **worst case** 3/8 FFN + 1/2 GDN <br> **average** 9/16 FFN + 3/4 GDN | $3\log(L) \times n_v \times d_h^2$
+| Only full attention KV | $0$ (skip GA only, recompute all GDN) | $L \times n_{kv} \times d_a \times 2$ |
+| Block + KV | $L \bmod B$ | $L \times n_{kv} \times d_a \times 2 + \lfloor L/B \rfloor \times n_v \times d_h^2 \times 3$ |
+| Logarithmic + KV | **worst** $L/2$, **avg** $\sim L/4$ | $L \times n_{kv} \times d_a \times 2 + 3\log_2(L) \times n_v \times d_h^2$ |
 
 ## Huggingface Transformers prototype
 
@@ -77,7 +79,7 @@ To evaluate caching strategies under realistic workloads, `benchmark_e2e.py` rep
 
 > Left panel — Prefill time vs context length. Here i have 40 dialog histories and send them in random order preserving in-conversation order. I measure prefill wall time, cache is stored at CPU. In total, there are 852 requests and 3 GB prefix cache budget (5M tokens overall). Right panel — per-request relative speedup.
 
-Speedup is possible because logarithmic checkpoints use $\sim O(\log L)$ memory per entry (vs $O(L/B)$ for block), so more conversations fit in the 3 GB budget simultaneously, yielding higher hit rates (80% cache hits vs 10% for block-boundary).
+Speedup is possible because logarithmic checkpoints add only $O(\log L)$ GDN state overhead per entry (vs $O(L/B)$ for block), so more conversations fit in the cache budget simultaneously, yielding higher hit rates.
 
 
 > **TODO:** add relative speedup boxplot

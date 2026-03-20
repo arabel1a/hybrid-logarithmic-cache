@@ -1,6 +1,6 @@
-"""Empirical benchmark of prefix caching strategies (compute only).
+"""Empirical benchmark of prefix caching strategies.
 
-Attention cost is measured once per sequence length and added to checkpoint strategies.
+All checkpoint strategies store both GDN recurrent states and attention KV cache.
 Results saved to baselines_results.json.
 """
 import spase_cache
@@ -13,7 +13,6 @@ from omegaconf import DictConfig, OmegaConf
 
 from spase_cache.checkpoint_cache import (
     prefill_from_checkpoint,
-    gdn_cache_bytes,
 )
 from spase_cache.utils import (
     setup_output_dir,
@@ -25,7 +24,6 @@ from spase_cache.utils import (
     free_gpu,
     reset_peak_memory,
     prefill_and_capture_at,
-    disable_attention_layers,
     time_fn,
     warmup,
 )
@@ -34,9 +32,10 @@ from spase_cache.strategies import checkpoint_positions
 log = logging.getLogger(__name__)
 
 def _save_results(path, data):
+    print(data)
     path.write_text(json.dumps(data, indent=2))
 
-@hydra.main(config_path="../conf", config_name="config", version_base="1.3")
+@hydra.main(config_path=r'../conf', config_name='config', version_base="1.3")
 def main(cfg: DictConfig):
     out_dir = setup_output_dir(cfg, "benchmark_single")
     model = make_model(cfg)
@@ -49,8 +48,9 @@ def main(cfg: DictConfig):
     n_runs = bb.n_runs
     strategies = list(bb.strategies)
 
-    results = {k: [] for k in strategies}
-    cache_sizes = {k: [] for k in strategies}
+    all_keys = list(strategies)
+    results = {k: [] for k in all_keys}
+    cache_sizes = {k: [] for k in all_keys}
     completed_seq_lens = []
 
     out_path = out_dir / "baselines_results.json"
@@ -74,52 +74,42 @@ def main(cfg: DictConfig):
         warmup(model, N)
         free_gpu()
 
-        # Measure full no_cache and attention cost
+        # Measure full no_cache baseline
         input_ids = torch.randint(0, config.vocab_size, (1, N)).to(dev)
         t_full = time_fn(n_runs, dev, prefill_baseline, model, input_ids)
-        with disable_attention_layers(model):
-            t_gdn_only = time_fn(n_runs, dev, prefill_baseline, model, input_ids)
-        attn_cost = max(t_full - t_gdn_only, 0)
-        # todo: add kvcache size
-        # todo: actually it shpuld skip ffns too, co add ffn calculation
         times = {"no_cache": t_full}
         bytes_map = {"no_cache": 0}
 
-        # Checkpoint strategies: measure GDN-only time, add attn cost
+        # Checkpoint strategies: always include KV cache
         for strat in strategies:
             if strat == "no_cache":
                 continue
 
             positions = checkpoint_positions(strat, N, B)
             store = prefill_and_capture_at(model, input_ids, positions)
-            bytes_map[strat] = gdn_cache_bytes(store)
-
-            store.to(dev)
-            with disable_attention_layers(model):
-                t = time_fn(n_runs, dev, prefill_from_checkpoint, model, input_ids, store)
+            bytes_map[strat] = store.memory_bytes()
             store.to("cpu")
-            times[strat] = t + attn_cost
-            times[strat + "+attn_cache"] = t
+
+            times[strat] = time_fn(n_runs, dev, prefill_from_checkpoint, model, input_ids, store)
 
             del store; free_gpu()
             reset_peak_memory()
 
-        for k in strategies:
+        for k in all_keys:
             results[k].append(times.get(k, 0))
             cache_sizes[k].append(bytes_map.get(k, 0))
 
         completed_seq_lens.append(N)
 
         parts = [f"N={N:5d}"]
-        for k in strategies:
+        for k in all_keys:
             parts.append(f"{k} {times.get(k, 0)*1000:7.1f}ms")
         log.info(" | ".join(parts))
-
         _save_results(out_path, {
             "model_name": cfg.model.name,
             "block_size": B,
             "seq_lens": completed_seq_lens,
-            "strategies": {k: {"times_s": results[k], "cache_bytes": cache_sizes[k]} for k in strategies},
+            "strategies": {k: {"times_s": results[k], "cache_bytes": cache_sizes[k]} for k in all_keys},
             "model_params": model_params,
         })
         log.info("Saved results to %s", out_path)
