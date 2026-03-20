@@ -88,6 +88,15 @@ def tokenize(out_dir, full_cfg, **_kw):
     df = df.filter(pl.col("cum_tokens") <= full_cfg.data.max_seq_len)
     log.info(f"Tokenized {len(df)} messages ({n_before - len(df)} truncated)")
 
+    # skip conversations whose total length is below min_seq_len
+    min_seq_len = full_cfg.data.get("min_seq_len", 0)
+    if min_seq_len > 0:
+        conv_total = df.group_by("url").agg(pl.col("tokens").list.len().sum().alias("total_tokens"))
+        short_convs = conv_total.filter(pl.col("total_tokens") < min_seq_len)["url"]
+        n_convs_before = df.n_unique("url")
+        df = df.filter(~pl.col("url").is_in(short_convs))
+        log.info(f"Dropped {n_convs_before - df.n_unique('url')} conversations shorter than {min_seq_len} tokens")
+
     prepared_path = Path(full_cfg.data.processed)
     prepared_path.parent.mkdir(parents=True, exist_ok=True)
     df.write_parquet(prepared_path)
