@@ -274,31 +274,32 @@ def disable_attention_layers(model):
 # ---------------------------------------------------------------------------
 # FIFO prefix cache with memory budget
 # ---------------------------------------------------------------------------
-def _truncate_store(store, budget_bytes):
-    """Remove GDN checkpoints (smallest positions first) until store fits in budget.
-    Returns (store, new_size) or (None, 0) if even KV-only exceeds budget."""
-    size = store.memory_bytes()
-    if size <= budget_bytes:
-        return store, size
+def _truncate_gdn(store, gdn_budget):
+    """Remove GDN checkpoints (smallest positions first) until GDN fits in budget."""
+    gdn_size = store.gdn_bytes()
+    if gdn_size <= gdn_budget:
+        return store
     positions = sorted(store.checkpoints.keys())
     for pos in positions:
         ckpt = store.checkpoints.pop(pos)
         for t in ckpt.recurrent_states.values():
-            size -= t.nelement() * t.element_size()
+            gdn_size -= t.nelement() * t.element_size()
         for t in ckpt.conv_states.values():
-            size -= t.nelement() * t.element_size()
-        if size <= budget_bytes:
-            return store, size
-    if size > budget_bytes:
-        return None, 0
-    return store, size
+            gdn_size -= t.nelement() * t.element_size()
+        if gdn_size <= gdn_budget:
+            return store
+    return store  # all checkpoints removed
 
 
 class PrefixCache:
-    def __init__(self, budget_bytes):
-        self.budget = budget_bytes
-        self.used = 0
-        self.entries = OrderedDict()  # key -> (store, size_bytes)
+    """FIFO prefix cache with separate KV and GDN budgets."""
+
+    def __init__(self, kv_budget_bytes, gdn_budget_bytes):
+        self.kv_budget = kv_budget_bytes
+        self.gdn_budget = gdn_budget_bytes
+        self.kv_used = 0
+        self.gdn_used = 0
+        self.entries = OrderedDict()  # key -> (store, kv_bytes, gdn_bytes)
 
     def get(self, key):
         if key in self.entries:
@@ -313,17 +314,33 @@ class PrefixCache:
                 return self.entries[k][0], t
         return None, -1
 
-    def put(self, key, store, size_bytes):
-        if size_bytes > self.budget:
-            store, size_bytes = _truncate_store(store, self.budget)
-            if store is None:
-                return
-        while self.used + size_bytes > self.budget and self.entries:
-            _, (_, evicted_size) = self.entries.popitem(last=False)
-            self.used -= evicted_size
-        self.entries[key] = (store, size_bytes)
-        self.used += size_bytes
+    def put(self, key, store, _size_bytes=None):
+        # Truncate GDN checkpoints if they exceed per-entry GDN budget
+        _truncate_gdn(store, self.gdn_budget)
+
+        kv_b = store.kv_bytes()
+        gdn_b = store.gdn_bytes()
+
+        if kv_b > self.kv_budget:
+            return  # single entry's KV exceeds budget, skip
+
+        # Evict oldest entries until both budgets have room
+        while self.entries and (
+            self.kv_used + kv_b > self.kv_budget or
+            self.gdn_used + gdn_b > self.gdn_budget
+        ):
+            _, (_, evicted_kv, evicted_gdn) = self.entries.popitem(last=False)
+            self.kv_used -= evicted_kv
+            self.gdn_used -= evicted_gdn
+
+        self.entries[key] = (store, kv_b, gdn_b)
+        self.kv_used += kv_b
+        self.gdn_used += gdn_b
 
     @property
     def n_entries(self):
         return len(self.entries)
+
+    @property
+    def used(self):
+        return self.kv_used + self.gdn_used

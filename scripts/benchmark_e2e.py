@@ -96,17 +96,17 @@ def interleave(requests, seed):
     return ordered
 
 
-def simulate(model, requests, conv_tokens, vocab_size, strategy, cache_budget,
-             progress=False):
+def simulate(model, requests, conv_tokens, vocab_size, strategy,
+             kv_budget, gdn_budget, progress=False):
     """Run all requests through the model with given caching strategy.
 
-    All checkpoint strategies store both GDN recurrent states and attention KV
-    cache, since GDN-only checkpointing cannot skip FFN compute (the GA layer
-    needs hidden states produced by GDN FFNs).
+    KV cache and GDN checkpoints have separate budgets. KV cache alone cannot
+    skip compute (attention needs Q from GDN FFN hidden states), but is required
+    so attention can attend to history without re-encoding old tokens.
     """
     dev = _model_device(model)
     uses_cache = strategy.tag != "no_cache"
-    cache = PrefixCache(cache_budget) if uses_cache else None
+    cache = PrefixCache(kv_budget, gdn_budget) if uses_cache else None
     per_request = []
 
     for conv_id, turn, n_msgs in tqdm(requests, desc=strategy.tag, disable=not progress):
@@ -128,7 +128,8 @@ def simulate(model, requests, conv_tokens, vocab_size, strategy, cache_budget,
             prefill_from_checkpoint(model, input_ids, cached_store)
             _sync_device(dev)
             dt = time.perf_counter() - t0
-            ckpt = cached_store.best_checkpoint(seq_len)
+            kv_len = min(cached_store.kv_len, seq_len)
+            ckpt = cached_store.best_checkpoint(min(kv_len, seq_len))
             if ckpt:
                 tokens_saved = ckpt.position
         else:
@@ -142,9 +143,8 @@ def simulate(model, requests, conv_tokens, vocab_size, strategy, cache_budget,
         if uses_cache:
             positions = checkpoint_positions(seq_len, **strategy)
             store = prefill_and_capture_at(model, input_ids, positions)
-            size = store.memory_bytes()
             store.to("cpu")
-            cache.put((conv_id, turn), store, size)
+            cache.put((conv_id, turn), store)
 
         per_request.append({
             "conv_id": str(conv_id), "turn": turn, "seq_len": seq_len,
@@ -169,7 +169,8 @@ def main(cfg: DictConfig):
     config = model.config
     e2e = cfg.benchmark_e2e
     strategies = list(cfg.strategies)
-    cache_budget = int(e2e.cache_budget_gb * 1e9)
+    kv_budget = int(e2e.kv_budget_gb * 1e9)
+    gdn_budget = int(e2e.gdn_budget_gb * 1e9)
     progress = e2e.get("progress", True)
 
     # Load and interleave requests
@@ -181,8 +182,8 @@ def main(cfg: DictConfig):
         sum(len(t) for t in conv_tokens[url][:n_msgs])
         for url, _, n_msgs in requests
     )
-    log.info("Total requests: %d, tokens: %d, cache budget: %.1f GB",
-             len(requests), total_tokens, e2e.cache_budget_gb)
+    log.info("Total requests: %d, tokens: %d, KV budget: %.1f GB, GDN budget: %.1f GB",
+             len(requests), total_tokens, e2e.kv_budget_gb, e2e.gdn_budget_gb)
 
     # Warmup
     log.info("Warming up...")
@@ -196,7 +197,8 @@ def main(cfg: DictConfig):
         "model_name": cfg.model.name,
         "n_requests": len(requests),
         "total_tokens": total_tokens,
-        "cache_budget_gb": e2e.cache_budget_gb,
+        "kv_budget_gb": e2e.kv_budget_gb,
+        "gdn_budget_gb": e2e.gdn_budget_gb,
         "strategies": {},
         "strategy_styles": OmegaConf.to_container(cfg.strategies, resolve=True),
     }
@@ -205,7 +207,7 @@ def main(cfg: DictConfig):
     for strat in strategies:
         log.info("Strategy: %s", strat.tag)
         res = simulate(model, requests, conv_tokens, vocab_size,
-                       strat, cache_budget, progress=progress)
+                       strat, kv_budget, gdn_budget, progress=progress)
 
         log.info("  %s: total=%.1fs", strat.tag, res["total_time"])
         if res["hits"] > 0:

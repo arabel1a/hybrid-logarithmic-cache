@@ -95,14 +95,15 @@ benchmark_baselines:
   n_runs: 3
 
 benchmark_e2e:
-  cache_budget_gb: 4.0
+  kv_budget_gb: 3.0
+  gdn_budget_gb: 1.0
   progress: true
 
 overlap_distribution:
   batch_size: 5000
 
 prepare_data:
-  _target_: prepare_data.tokenize  # or prepare_data.tokenize, prepare_data.compute_overlap
+  _target_: prepare_data.prepare_all  # or prepare_data.tokenize, prepare_data.compute_overlap
   tokenizer_chunk_size: 2048
 
 plot_results:

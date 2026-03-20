@@ -24,14 +24,16 @@ All strategies store attention KV cache for the full cached prefix alongside GDN
 
 **Why KV cache alone cannot skip any compute:** to produce GDN input at layer $i$, we need attention output at layer $i-1$. Attention output requires Q projected from current hidden states (produced by preceding GDN+FFN layers), so no layer's forward pass can be skipped. KV cache for positions before the checkpoint is still necessary so that attention can attend to the full history without re-encoding old tokens into K,V.
 
-| Strategy |  Checkpoint positions | Tail tokens to recompute | GDN checkpoint count | Cache size per group per sequence |
-| --- |  --- | --- | --- | --- |
-| No cache | — | $L$ | 0 | 0 |
-| KV only |  — (no GDN ckpts) | $L$ (equivalent to no cache) | 0 | $2 L n_{kv} d_a$ |
-| Block (fixed $B$) |  $B, 2B, \ldots$ | $L \bmod B$ | $\lfloor L/B \rfloor$ | $2 L n_{kv} d_a + 3\lfloor L/B \rfloor n_v d_h^2$ |
-| Balanced ($k$ blocks) |  $\lfloor L/k \rfloor, 2\lfloor L/k \rfloor, \ldots$ | $L \bmod \lfloor L/k \rfloor$ | $k$ | $2 L n_{kv} d_a + 3 k \, n_v d_h^2$ |
-| Sqrt |  $\sqrt{L}$-spaced | $L \bmod \lfloor\sqrt{L}\rfloor$ | $\lfloor\sqrt{L}\rfloor$ | $2 L n_{kv} d_a + 3\lfloor\sqrt{L}\rfloor n_v d_h^2$ |
-| Diadic |  $1, 2, 4, \ldots, 2^{\lfloor\log_2 L\rfloor}$ | worst $L/2$, avg $\sim L/4$ | $\lfloor\log_2 L\rfloor + 1$ | $2 L n_{kv} d_a + 3(\log_2 L) n_v d_h^2$ |
+Let $r = \frac{3 n_v d_h^2}{2 n_{kv} d_a}$ be the ratio of per-checkpoint GDN size to per-token KV size (for 0.8B: $r = 768$; for 27B: $r = 4608$).
+
+| Strategy | Checkpoint positions | Tail tokens to recompute | GDN $\geq$ KV when | Cache size per group per sequence |
+| --- | --- | --- | --- | --- |
+| No cache | — | $L$ | — | 0 |
+| KV only | — (no GDN ckpts) | $L$ (equivalent to no cache) | — | $2 L n_{kv} d_a$ |
+| Block (fixed $B$) | $B, 2B, \ldots$ | $L \bmod B$ | $B \leq r$ | $2 L n_{kv} d_a + 3\lfloor L/B \rfloor n_v d_h^2$ |
+| Balanced ($k$ blocks) | $\lfloor L/k \rfloor, 2\lfloor L/k \rfloor, \ldots$ | $L \bmod \lfloor L/k \rfloor$ | $k \geq L/r$ | $2 L n_{kv} d_a + 3 k \, n_v d_h^2$ |
+| Sqrt | $\sqrt{L}$-spaced | $L \bmod \lfloor\sqrt{L}\rfloor$ | $L \leq r^2$ | $2 L n_{kv} d_a + 3\lfloor\sqrt{L}\rfloor n_v d_h^2$ |
+| Diadic | $1, 2, 4, \ldots, 2^{\lfloor\log_2 L\rfloor}$ | worst $L/2$, avg $\sim L/4$ | $L \lesssim r \log_2 r$ | $2 L n_{kv} d_a + 3(\log_2 L) n_v d_h^2$ |
 
 Currently vLLM uses dense $O(L/B)$ checkpoints (linear in sequence length). We propose exchanging some tail recomputation for asymptotically less memory (e.g. $O(\log L)$ vs $O(L/B)$ GDN states), leading to higher cache hit rates under fixed memory budgets.
 

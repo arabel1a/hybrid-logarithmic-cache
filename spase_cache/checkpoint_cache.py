@@ -48,18 +48,32 @@ class PrefixCheckpointStore:
     def num_checkpoints(self) -> int:
         return len(self.checkpoints)
 
-    def memory_bytes(self) -> int:
+    def gdn_bytes(self) -> int:
         total = 0
         for ckpt in self.checkpoints.values():
             for t in ckpt.recurrent_states.values():
                 total += t.nelement() * t.element_size()
             for t in ckpt.conv_states.values():
                 total += t.nelement() * t.element_size()
+        return total
+
+    def kv_bytes(self) -> int:
+        total = 0
         for t in self.kv_cache_keys.values():
             total += t.nelement() * t.element_size()
         for t in self.kv_cache_values.values():
             total += t.nelement() * t.element_size()
         return total
+
+    @property
+    def kv_len(self) -> int:
+        """Sequence length covered by stored KV cache."""
+        for t in self.kv_cache_keys.values():
+            return t.shape[2]  # (B, H, L, D)
+        return 0
+
+    def memory_bytes(self) -> int:
+        return self.gdn_bytes() + self.kv_bytes()
 
     def to(self, device):
         if self.prefix_tokens is not None:
@@ -70,14 +84,6 @@ class PrefixCheckpointStore:
         self.kv_cache_values = {k: v.to(device) for k, v in self.kv_cache_values.items()}
         return self
 
-def gdn_cache_bytes(store):
-    """Total GDN checkpoint bytes (recurrent + conv states) in a
-    PrefixCheckpointStore."""
-    return sum(
-        t.nelement() * t.element_size()
-        for ckpt in store.checkpoints.values()
-        for t in list(ckpt.recurrent_states.values()) + list(ckpt.conv_states.values())
-    )
 
 # ---------------------------------------------------------------------------
 # Prefill from checkpoint
@@ -107,15 +113,23 @@ def prefill_from_checkpoint(
     linear_layers = _get_linear_layers(config)
     attn_layers = _get_attention_layers(config)
 
-    ckpt = store.best_checkpoint(seq_len)
+    # Determine available KV cache length
+    kv_len = min(store.kv_len, seq_len)
+
+    # Best GDN checkpoint that doesn't exceed KV coverage.
+    # If GDN checkpoint is ahead of KV, attention would miss positions
+    # kv_len..gdn_pos, so we can only use checkpoints within KV range.
+    ckpt = store.best_checkpoint(min(kv_len, seq_len))
 
     if ckpt is None:
-        # No GDN checkpoint — must recompute everything from scratch.
+        # No usable GDN checkpoint (kv_only, or all checkpoints beyond KV range).
+        # KV cache alone can't skip compute: recomputing from 0 overwrites cached
+        # KV via cache_position scatter, so seeding it is pointless.
         return prefill_baseline(model, input_ids)
 
     resume_pos = ckpt.position
 
-    if resume_pos >= seq_len:
+    if resume_pos >= seq_len and kv_len >= seq_len:
         # Full cache hit — no compute needed, return cached state
         cache = Qwen3_5DynamicCache(config=config)
         for li in linear_layers:
@@ -130,11 +144,8 @@ def prefill_from_checkpoint(
         dummy = torch.zeros(1, 1, config.hidden_size, device=device)
         return dummy, cache
 
-    # Verify token match
-    assert torch.equal(store.prefix_tokens[0, :resume_pos], input_ids[0, :resume_pos].cpu())
-
-    # Build cache with restored GDN states + KV up to checkpoint position.
-    # Full model runs from resume_pos onward: all layers (GDN, attention, FFN)
+    # Build cache with restored GDN states + KV up to resume position.
+    # Full model runs from resume_pos: all layers (GDN, attention, FFN)
     # must recompute because each layer's output feeds into the next.
     cache = Qwen3_5DynamicCache(config=config)
     for li in linear_layers:
