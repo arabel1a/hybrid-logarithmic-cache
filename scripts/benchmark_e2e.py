@@ -100,17 +100,19 @@ def interleave(requests, seed):
 
 
 def simulate(model, requests, conv_tokens, vocab_size, strategy, cache_budget,
-             block_size, skip_attention=False, progress=False):
+             skip_attention=False, progress=False):
     """Run all requests through the model with given caching strategy."""
+
+    print(strategy)
     dev = _model_device(model)
-    uses_cache = strategy != "no_cache"
+    uses_cache = strategy.tag != "no_cache"
     cache = PrefixCache(cache_budget) if uses_cache else None
 
     ctx = disable_attention_layers(model) if skip_attention else nullcontext()
     per_request = []
 
     with ctx:
-        for conv_id, turn, n_msgs in tqdm(requests, desc=strategy, disable=not progress):
+        for conv_id, turn, n_msgs in tqdm(requests, desc=strategy.tag, disable=not progress):
             all_toks = [t for toks in conv_tokens[conv_id][:n_msgs] for t in toks]
             input_ids = torch.tensor([all_toks], dtype=torch.long).to(dev) % vocab_size
             seq_len = input_ids.shape[1]
@@ -143,7 +145,7 @@ def simulate(model, requests, conv_tokens, vocab_size, strategy, cache_budget,
 
             # Capture checkpoints for cache
             if uses_cache:
-                positions = checkpoint_positions(strategy, seq_len, block_size)
+                positions = checkpoint_positions(strategy.tag, **strategy)
                 store = prefill_and_capture_at(model, input_ids, positions)
                 if skip_attention:
                     store.kv_cache_keys = {}
@@ -174,10 +176,8 @@ def main(cfg: DictConfig):
     dev = _model_device(model)
     config = model.config
     e2e = cfg.benchmark_e2e
-
-    strategies = list(e2e.strategies)
+    strategies = list(cfg.strategies)
     cache_budget = int(e2e.cache_budget_gb * 1e9)
-    B = cfg.baseline.block_size
     progress = e2e.get("progress", True)
 
     # Load and interleave requests
@@ -204,7 +204,6 @@ def main(cfg: DictConfig):
 
     summary = {
         "model_name": cfg.model.name,
-        "block_size": B,
         "n_requests": len(requests),
         "total_tokens": total_tokens,
         "cache_budget_gb": e2e.cache_budget_gb,
@@ -213,11 +212,10 @@ def main(cfg: DictConfig):
     summary_path = out_dir / "e2e_summary.json"
 
     # Measure per-request attention cost (no_cache full vs GDN-only)
-    has_ckpt_strategies = any(s != "no_cache" for s in strategies)
     res_full = None
     attn_costs = None
 
-    if has_ckpt_strategies:
+    if e2e.measure_attn_cost:
         log.info("Measuring attention cost (no_cache full vs GDN-only)...")
         res_full = simulate(model, requests, conv_tokens, vocab_size,
                             "no_cache", 0, B, skip_attention=False, progress=progress)
@@ -236,11 +234,11 @@ def main(cfg: DictConfig):
                 res = res_full
             else:
                 res = simulate(model, requests, conv_tokens, vocab_size,
-                              "no_cache", 0, B, progress=progress)
+                              "no_cache", 0, progress=progress)
         else:
             # Run with skipped attention, add per-request attn cost
             res = simulate(model, requests, conv_tokens, vocab_size,
-                           strat, cache_budget, B, skip_attention=True, progress=progress)
+                           strat, cache_budget, skip_attention=True, progress=progress)
             for i, entry in enumerate(res["per_request"]):
                 entry["time_s"] += attn_costs[i]
             res["total_time"] = sum(e["time_s"] for e in res["per_request"])
@@ -255,7 +253,7 @@ def main(cfg: DictConfig):
         _save_jsonl(jsonl_path, res["per_request"])
 
         # Update summary
-        summary["strategies"][strat] = {
+        summary["strategies"][strat.tag] = {
             "total_time": res["total_time"],
             "hits": res["hits"],
             "tokens_saved": res["tokens_saved"],

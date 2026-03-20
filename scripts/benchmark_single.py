@@ -46,6 +46,7 @@ def main(cfg: DictConfig):
     bb = cfg.benchmark_baselines
     seq_lens = list(bb.seq_lens)
     B = cfg.baseline.block_size
+    BN = cfg.baseline.n_blocks
     n_runs = bb.n_runs
     strategies = list(bb.strategies)
 
@@ -90,7 +91,7 @@ def main(cfg: DictConfig):
             if strat == "no_cache":
                 continue
 
-            positions = checkpoint_positions(strat, N, B)
+            positions = checkpoint_positions(strat, N block_size=B )
             store = prefill_and_capture_at(model, input_ids, positions)
             bytes_map[strat] = gdn_cache_bytes(store)
 
