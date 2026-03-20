@@ -14,6 +14,7 @@ data:
   max_seq_len: 16384 # maximum request length 
   max_rounds: 36 # there are few sequences of very many rounds (up to 800), which bloats the number of requests (quadratic amount of total token). I filter 95th percentile
   max_rows: 1000000
+  tokenizer_chunk_size: 2048
  
 baseline:
   block_size: 128 # block size for dense caching

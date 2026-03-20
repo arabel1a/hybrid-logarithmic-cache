@@ -8,6 +8,7 @@ import json
 import logging
 from pathlib import Path
 
+import numpy as np
 import polars as pl
 import hydra
 from omegaconf import DictConfig
@@ -19,10 +20,8 @@ from spase_cache.utils import setup_output_dir
 log = logging.getLogger(__name__)
 
 
-class _TrieNode:
-    __slots__ = ["c"]
-    def __init__(self):
-        self.c = {}
+_HASH_PRIME = 2654435761
+_HASH_MASK = (1 << 63) - 1
 
 def filter(raw_path, max_rounds, max_rows):
     log.info(f"Loading {raw_path}...")
@@ -71,13 +70,15 @@ def tokenize_messages(df, tokenizer_name, max_seq_len, chunk_size=4096):
         ).alias("_formatted")
     ).drop("_is_first")
 
-    # tokenize in chunks to avoid holding all text in python at once
+    # tokenize in chunks, converting to numpy immediately to avoid Python int overhead
+    # (Python int = 28 bytes each vs numpy int32 = 4 bytes)
     log.info("Tokenizing messages...")
     formatted = df["_formatted"]
     all_tokens = []
-    for i in range(0, len(formatted), chunk_size):
+    for i in tqdm(range(0, len(formatted), chunk_size), desc="tokenizing chunks"):
         chunk_texts = formatted[i:i + chunk_size].to_list()
-        all_tokens.extend(tokenizer(chunk_texts, add_special_tokens=False)["input_ids"])
+        for ids in tokenizer(chunk_texts, add_special_tokens=False)["input_ids"]:
+            all_tokens.append(np.array(ids, dtype=np.int32))
         del chunk_texts
     df = df.drop("_formatted", "plain_text").with_columns(pl.Series("tokens", all_tokens))
     del all_tokens
@@ -92,36 +93,36 @@ def tokenize_messages(df, tokenizer_name, max_seq_len, chunk_size=4096):
     return df
 
 
-def compute_overlap(df, out_dir):
-    """Compute prefix overlap using trie over tokenized requests.
-
-    Iterates user-ending turns sorted by ts. For each, the prefix is the
-    concatenation of all message tokens up to and including that turn.
-    """
+def _extract_overlap_data(df):
+    """Extract lightweight data needed for overlap computation."""
     log.info("Computing prefix overlap distribution...")
 
-    # get user-ending rows sorted by ts
     user_rows = df.filter(pl.col("role") == "user").sort("ts")
-
     n_conversations = user_rows.n_unique("url")
     log.info(f"{len(user_rows)} requests from {n_conversations} conversations")
 
-    # precompute per-conversation token lists for fast prefix lookup
     conv_tokens = {}
     for url in df["url"].unique(maintain_order=True).to_list():
         conv = df.filter(pl.col("url") == url).sort("message_index")
         conv_tokens[url] = (
             conv["message_index"].to_list(),
-            conv["tokens"].to_list(),
+            [np.array(t, dtype=np.int32) for t in conv["tokens"].to_list()],
         )
 
-    root = _TrieNode()
+    iter_urls = user_rows["url"].to_list()
+    iter_msg_indices = user_rows["message_index"].to_list()
+    return conv_tokens, iter_urls, iter_msg_indices, n_conversations
+
+
+def compute_overlap(conv_tokens, iter_urls, iter_msg_indices, n_conversations, out_dir):
+    """Compute prefix overlap using rolling hash over tokenized requests."""
+    seen = set()  # rolling hashes at each token position
     lcp_lengths = []
 
     log.info("Simulating non-deleting prefix cache...")
     for url, msg_idx in tqdm(
-        zip(user_rows["url"].to_list(), user_rows["message_index"].to_list()),
-        total=len(user_rows),
+        zip(iter_urls, iter_msg_indices),
+        total=len(iter_urls),
     ):
         msg_indices, token_lists = conv_tokens[url]
         # find how many messages to include (up to and including msg_idx)
@@ -131,28 +132,25 @@ def compute_overlap(df, out_dir):
             if mi == msg_idx:
                 break
 
-        node = root
+        h = 0
         lcp = 0
         matched = True
 
         for tokens in token_lists[:n_msgs]:
             for t in tokens:
-                t_int = int(t)
-                if matched and t_int in node.c:
+                h = (h * _HASH_PRIME + int(t) + 1) & _HASH_MASK
+                if matched and h in seen:
                     lcp += 1
-                    node = node.c[t_int]
                 else:
                     matched = False
-                    new_node = _TrieNode()
-                    node.c[t_int] = new_node
-                    node = new_node
+                seen.add(h)
 
         lcp_lengths.append(lcp)
 
     overlap_path = out_dir / "overlap_lcp.json"
     overlap_path.write_text(json.dumps({
         "lcp_lengths": lcp_lengths,
-        "n_requests": len(user_rows),
+        "n_requests": len(iter_urls),
         "n_conversations": n_conversations,
     }))
 
@@ -167,7 +165,7 @@ def main(cfg: DictConfig):
     out_dir = setup_output_dir(cfg)
 
     df = filter(cfg.data.raw_path, cfg.data.max_rounds, cfg.data.max_rows)
-    df = tokenize_messages(df, cfg.model.tokenizer, cfg.data.max_seq_len)
+    df = tokenize_messages(df, cfg.model.tokenizer, cfg.data.max_seq_len, cfg.data.tokenizer_chunk_size)
 
     # save for downstream benchmark_e2e
     prepared_path = Path(cfg.data.processed)
@@ -175,7 +173,9 @@ def main(cfg: DictConfig):
     df.write_parquet(prepared_path)
     log.info(f"Saved {len(df)} messages to {prepared_path}")
 
-    compute_overlap(df, out_dir)
+    overlap_data = _extract_overlap_data(df)
+    del df
+    compute_overlap(*overlap_data, out_dir)
 
 if __name__ == "__main__":
     main()
