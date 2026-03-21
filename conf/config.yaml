@@ -37,34 +37,39 @@ strategies:
     linewidth: 2
 
   - tag: "balanced_fix_blocksize"
-    block_size: 128
-    name: "Block (B=128)"
+    block_size: 768
+    name: "Block (B=768)"
     color: "tab:blue"
     marker: "^"
     linestyle: "-"
     linewidth: 1.5
 
   - tag: "balanced_fix_nblocks"
-    n_blocks: 4
+    n_blocks: 1
     name: "Balanced (4 blocks)"
     color: "tab:cyan"
     marker: "D"
     linestyle: "-"
     linewidth: 1.5
+    skip: 768
 
-  - tag: "sqrt"
-    name: "Sqrt"
-    color: "tab:green"
-    marker: "p"
-    linestyle: "-"
-    linewidth: 2
-
+    # skipped: i cant afford such context lengths
+#   - tag: "sqrt"
+#     name: "Sqrt"
+#     color: "tab:green"
+#     marker: "p"
+#     linestyle: "-"
+#     linewidth: 2
+#     skip: 768 * 768
+# 
   - tag: "diadic"
-    name: "Logarithmic"
+    name: "Logarithmic (starting at 768)"
     color: "tab:orange"
     marker: "v"
     linestyle: "-"
     linewidth: 2
+    startat: 768
+
 
 # Qwen3.5-0.8B dimensions
 model:
@@ -87,18 +92,19 @@ model:
   linear_num_value_heads: 16 # = gdn_nv
   max_position_embeddings: 262144
   rope_theta: 10000000.0
+  r: 768
 
 test:
   seq_len: 100
   tolerance: 1.0e-3
 
 benchmark_baselines:
-  seq_lens: [1023, 1024, 1536, 2047, 2048, 3072, 4095, 4096, 6144, 8191, 8192, 16383, 16384, 32767, 32768]
+  seq_lens: [1023, 1024, 1536, 2047, 2048, 3072, 4095, 4096, 6144, 8191, 8192, 16383, 16384, 20000]
   n_runs: 3
 
 benchmark_e2e:
-  kv_budget_gb: 3.0
-  gdn_budget_gb: 1.0
+  kv_budget_gb: 5.0
+  gdn_budget_gb: 5.0
   progress: true
 
 overlap_distribution:

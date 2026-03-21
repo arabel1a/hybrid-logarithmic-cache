@@ -20,21 +20,23 @@ def sqrt_positions(seq_len):
     block_size = int(math.sqrt(seq_len))
     return balanced_positions(seq_len, block_size=block_size)
 
-def diadic_positions(seq_len: int) -> list[int]:
+def diadic_positions(seq_len: int, start_at) -> list[int]:
     positions = []
     i = 0
     while (1 << i) <= seq_len:
+        if (1 << i) < start_at:
+            continue
         positions.append(1 << i)
         i += 1
     return positions
 
-def checkpoint_positions(seq_len, *, tag, block_size=None, n_blocks=None, **_ignored):
+def checkpoint_positions(seq_len, *, tag, block_size=None, n_blocks=None, start_at=0, skip=0, **_ignored):
     """Return list of positions where GDN checkpoints should be captured.
 
     Accepts the full strategy config dict as kwargs
     (e.g. ``checkpoint_positions(seq_len, **strategy)``).
     """
-    if tag in ("no_cache", "kv_only"):
+    if tag in ("no_cache", "kv_only") or seq_len < skip:
         return []
     if tag in ("block", "balanced_fix_blocksize"):
         return balanced_positions(seq_len, block_size=block_size)
@@ -43,5 +45,5 @@ def checkpoint_positions(seq_len, *, tag, block_size=None, n_blocks=None, **_ign
     if tag == "sqrt":
         return sqrt_positions(seq_len)
     if tag in ("log", "dyadic", "diadic"):
-        return diadic_positions(seq_len)
+        return diadic_positions(seq_len, start_at)
     raise ValueError(f"Unknown strategy: {tag}")
