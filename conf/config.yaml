@@ -80,6 +80,7 @@ strategies:
   - tag: "hist_frozen"
     type: "histogram_frozen"
     n_blocks: 1
+    bin_size: 128
     label: "DP-optimal (frozen)"
     color: "tab:purple"
     marker: "X"
@@ -89,6 +90,7 @@ strategies:
   - tag: "hist_periodic"
     type: "histogram_periodic"
     n_blocks: 1
+    bin_size: 128
     label: "DP-optimal (periodic H=100)"
     color: "tab:brown"
     marker: "P"
@@ -99,6 +101,7 @@ strategies:
   - tag: "hist_exp_decay"
     type: "histogram_exp_decay"
     n_blocks: 1
+    bin_size: 128
     label: "DP-optimal (exp decay γ=0.99)"
     color: "tab:olive"
     marker: "*"
@@ -106,6 +109,16 @@ strategies:
     linewidth: 2
     gamma: 0.99
     replan_interval: 100
+
+  - tag: "hist_mutual"
+    type: "histogram_mutual"
+    n_blocks: 1
+    label: "DP-optimal (joint len+overlap)"
+    color: "tab:pink"
+    marker: "d"
+    linestyle: "-"
+    linewidth: 2
+    bin_size: 128
 
 
 # Qwen3.5-0.8B dimensions
