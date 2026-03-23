@@ -59,12 +59,15 @@ class NemotronSweDataset(Dataset):
         cfg = self.cfg
         split = cfg.get("split", "train")
         max_sessions = cfg.get("max_sessions", 5000)
+        max_rows = cfg.get("max_rows", None)
         ds = load_dataset("nvidia/Nemotron-SWE-v1", split=split, streaming=True)
 
         rows = []
         n_sessions = 0
         for idx, row in enumerate(ds):
             if n_sessions >= max_sessions:
+                break
+            if max_rows and len(rows) >= max_rows:
                 break
             repo = row.get("repo", f"session_{idx}")
             calls = _extract_calls(row)

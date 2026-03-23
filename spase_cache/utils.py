@@ -16,6 +16,9 @@ import numpy as np
 import torch
 import yaml
 from omegaconf import DictConfig, OmegaConf
+
+OmegaConf.register_new_resolver("eval", eval, use_cache=True)
+
 from transformers.models.qwen3_5.configuration_qwen3_5 import Qwen3_5TextConfig
 from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache, Qwen3_5TextModel
 

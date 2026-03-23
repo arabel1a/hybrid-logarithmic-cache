@@ -41,6 +41,73 @@ def _spec(key, style_map):
     return key, 'gray', 'x', '-', 1
 
 
+def _build_style_index(summary):
+    """Build {tag: style_dict} from strategy_styles in summary JSON."""
+    return {s["tag"]: s for s in summary.get("strategy_styles", [])}
+
+
+def _sort_strategies_by_budget(strat_keys, style_index=None):
+    """Sort strategies so that same-budget strategies are adjacent.
+
+    Uses n_blocks from strategy_styles config when available.
+    """
+    FAMILY_ORDER = {
+        "balanced_fix_nblocks": 0, "histogram_frozen": 1, "histogram_exp_decay": 2,
+        "block": 3, "log": 4, "kv_only": -1, "no_cache": -2,
+    }
+
+    def _sort_key(s):
+        cfg = (style_index or {}).get(s, {})
+        stype = cfg.get("type", s)
+        family = FAMILY_ORDER.get(stype, 5)
+        n_blocks = cfg.get("n_blocks", 0)
+        block_size = cfg.get("block_size", 0)
+
+        if family <= 2:
+            return (n_blocks, family, s)
+        elif family < 0:
+            return (family, 0, s)
+        else:
+            return (1000 + block_size, family, s)
+
+    return sorted(strat_keys, key=_sort_key)
+
+
+def _group_strategies_by_budget(strat_keys, style_index=None):
+    """Group strategies into (budget_label, [strats]) for grid layout.
+
+    Reads n_blocks from strategy config. Strategies sharing the same n_blocks
+    are placed in the same row so they can be compared side by side.
+    """
+    from collections import OrderedDict
+
+    BUDGETED_TYPES = {"balanced_fix_nblocks", "histogram_frozen", "histogram_exp_decay"}
+    FAMILY_ORDER = {"balanced_fix_nblocks": 0, "histogram_frozen": 1, "histogram_exp_decay": 2}
+
+    budgeted = OrderedDict()
+    others = []
+
+    for s in strat_keys:
+        cfg = (style_index or {}).get(s, {})
+        stype = cfg.get("type", "")
+        if stype in BUDGETED_TYPES:
+            n_blocks = cfg.get("n_blocks", 0)
+            budgeted.setdefault(n_blocks, []).append(s)
+        else:
+            others.append(s)
+
+    groups = []
+    for budget, strats in sorted(budgeted.items()):
+        strats.sort(key=lambda s: FAMILY_ORDER.get(
+            (style_index or {}).get(s, {}).get("type", ""), 9))
+        groups.append((f"{budget} blocks", strats))
+
+    for s in others:
+        groups.append((s, [s]))
+
+    return groups
+
+
 # ---------------------------------------------------------------------------
 # Baselines plot
 # ---------------------------------------------------------------------------
@@ -220,7 +287,12 @@ def plot_e2e(out_dir, root_dir=None, style_map=None, **_kw):
         print("  no JSONL files found, skipping e2e plots")
         return
 
-    report = [s for s in strat_keys if s in per_request]
+    sidx = _build_style_index(summary)
+    report = _sort_strategies_by_budget([s for s in strat_keys if s in per_request], sidx)
+    # keep no_cache first
+    if "no_cache" in report:
+        report.remove("no_cache")
+        report = ["no_cache"] + report
     times_ms = {s: np.array([e["time_s"] for e in per_request[s]]) * 1000 for s in report}
     baseline_ms = times_ms.get("no_cache")
 
@@ -241,6 +313,7 @@ def plot_e2e(out_dir, root_dir=None, style_map=None, **_kw):
     ax1.set_ylabel("Per-request prefill time (ms)")
     ax1.set_title(f"Time distribution — {model_name}")
     ax1.grid(True, alpha=0.3, axis="y")
+    ax1.tick_params(axis="x", rotation=45, labelsize=7)
 
     if baseline_ms is not None:
         speedup_strats = [s for s in report if s != "no_cache"]
@@ -259,6 +332,7 @@ def plot_e2e(out_dir, root_dir=None, style_map=None, **_kw):
         ax2.set_ylabel("Speedup vs no-cache")
         ax2.set_title(f"Speedup distribution — {model_name}")
         ax2.grid(True, alpha=0.3, axis="y")
+        ax2.tick_params(axis="x", rotation=45, labelsize=7)
 
     plt.tight_layout()
     boxplots_path = out_dir / "e2e_boxplots.png"
@@ -398,8 +472,10 @@ def plot_tradeoff(out_dir, root_dir=None, style_map=None, **_kw):
     for key in strategies:
         if key == "no_cache":
             continue
-        label, color, marker, ls, lw = _spec(key, style_map)
         times = np.array(strategies[key]["times_s"])
+        if np.all(times == 0):
+            continue  # strategy not supported in benchmark_single
+        label, color, marker, ls, lw = _spec(key, style_map)
         speedup = np.mean(baseline_times / np.maximum(times, 1e-12))
         cache_mb = np.mean(to_mb(strategies[key]["cache_bytes"]))
         ax.scatter(cache_mb, speedup, s=120, color=color, marker=marker,
@@ -725,6 +801,371 @@ def plot_trie_diagnostics(out_dir, root_dir=None, style_map=None, **_kw):
 
 
 # ---------------------------------------------------------------------------
+# Plot 1: True data LCP over rounds per conversation (strategy-independent)
+# ---------------------------------------------------------------------------
+def plot_lcp_over_rounds(out_dir, root_dir=None, style_map=None, **_kw):
+    """Plot true prefix_match (data-level LCP) vs within-conversation round index.
+
+    prefix_match is identical across all strategies — it depends only on the data.
+    We use any single cached strategy as reference to extract the values.
+    """
+    from collections import defaultdict
+
+    out_dir = Path(out_dir)
+    root_dir = Path(root_dir) if root_dir else out_dir
+    data_dir = root_dir / "benchmark_e2e"
+    summary_path = data_dir / "e2e_summary.json"
+    if not summary_path.exists():
+        print(f"  skipping lcp_over_rounds ({summary_path} not found)")
+        return
+
+    summary = json.loads(summary_path.read_text())
+    model_name = summary["model_name"]
+    strat_keys = list(summary["strategies"].keys())
+
+    # Pick any cached strategy — prefix_match is the same for all
+    ref_strat = None
+    for s in strat_keys:
+        if s not in ("no_cache",):
+            jsonl = data_dir / f"e2e_{s}.jsonl"
+            if jsonl.exists():
+                ref_strat = s
+                break
+    if ref_strat is None:
+        return
+
+    entries = _load_jsonl(data_dir / f"e2e_{ref_strat}.jsonl")
+
+    # Group by conv_id, assign within-conversation round index
+    conv_entries = defaultdict(list)
+    for e in entries:
+        conv_entries[e["conv_id"]].append(e)
+
+    convs = list(conv_entries.keys())[:100]
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Left: LCP vs within-conversation round
+    cmap = plt.cm.tab20
+    for ci, cid in enumerate(convs):
+        es = conv_entries[cid]
+        rounds = list(range(len(es)))
+        lcp = [e["prefix_match"] for e in es]
+        color = cmap(ci % 20)
+        ax1.plot(rounds, lcp, color=color, alpha=0.4, lw=1.0, marker=".", markersize=3)
+
+    ax1.set_xlabel("Round (within conversation)")
+    ax1.set_ylabel("Prefix match length (tokens)")
+    ax1.set_title(f"LCP over rounds ({len(convs)} conversations)")
+    ax1.grid(True, alpha=0.3)
+
+    # Right: LCP as fraction of seq_len
+    for ci, cid in enumerate(convs):
+        es = conv_entries[cid]
+        rounds = list(range(len(es)))
+        lcp_frac = [e["prefix_match"] / e["seq_len"] if e["seq_len"] > 0 else 0 for e in es]
+        color = cmap(ci % 20)
+        ax1_r = ax2
+        ax1_r.plot(rounds, lcp_frac, color=color, alpha=0.4, lw=1.0, marker=".", markersize=3)
+
+    ax2.set_xlabel("Round (within conversation)")
+    ax2.set_ylabel("LCP / seq_len")
+    ax2.set_title("LCP as fraction of sequence length")
+    ax2.set_ylim(-0.05, 1.05)
+    ax2.grid(True, alpha=0.3)
+
+    fig.suptitle(f"True data LCP per conversation round — {model_name}", fontsize=12)
+    plt.tight_layout()
+    out = out_dir / "lcp_over_rounds.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"  saved {out}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Plot 2: Checkpoint positions for one conv across strategies
+# ---------------------------------------------------------------------------
+def plot_checkpoint_positions(out_dir, root_dir=None, style_map=None, **_kw):
+    """For one conversation, show checkpoint positions per round for each strategy."""
+    from collections import defaultdict
+
+    out_dir = Path(out_dir)
+    root_dir = Path(root_dir) if root_dir else out_dir
+    data_dir = root_dir / "benchmark_e2e"
+    summary_path = data_dir / "e2e_summary.json"
+    if not summary_path.exists():
+        print(f"  skipping checkpoint_positions ({summary_path} not found)")
+        return
+
+    summary = json.loads(summary_path.read_text())
+    model_name = summary["model_name"]
+    strat_keys = list(summary["strategies"].keys())
+
+    # Load all strategies
+    per_request = {}
+    for strat in strat_keys:
+        jsonl = data_dir / f"e2e_{strat}.jsonl"
+        if jsonl.exists():
+            per_request[strat] = _load_jsonl(jsonl)
+
+    show = [s for s in strat_keys if s in per_request and s != "no_cache" and s != "kv_only"]
+    if not show:
+        return
+
+    # Pick the conv_id with the most requests (from first strategy with cache)
+    ref = per_request[show[0]]
+    conv_counts = defaultdict(int)
+    for e in ref:
+        conv_counts[e["conv_id"]] += 1
+    target_conv = max(conv_counts, key=conv_counts.get)
+
+    sidx = _build_style_index(summary)
+    groups = _group_strategies_by_budget(show, sidx)
+    # Only keep groups whose strategies exist in per_request
+    groups = [(lbl, [s for s in strats if s in per_request])
+              for lbl, strats in groups]
+    groups = [(lbl, strats) for lbl, strats in groups if strats]
+
+    nrows = len(groups)
+    ncols = max(len(strats) for _, strats in groups)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 2.5 * nrows),
+                             sharex=True, sharey=True, squeeze=False)
+
+    for row, (group_label, strats) in enumerate(groups):
+        for col in range(ncols):
+            ax = axes[row][col]
+            if col >= len(strats):
+                ax.set_visible(False)
+                continue
+
+            strat = strats[col]
+            entries = [e for e in per_request[strat] if e["conv_id"] == target_conv]
+            label, color, *_ = _spec(strat, style_map)
+
+            for round_idx, e in enumerate(entries):
+                seq_len = e["seq_len"]
+                positions = e["added_positions"]
+                ax.barh(round_idx, seq_len, height=0.6, color=color, alpha=0.15)
+                if positions:
+                    ax.scatter(positions, [round_idx] * len(positions),
+                               s=8, color=color, zorder=3, alpha=0.7)
+                pm = e["prefix_match"]
+                if pm > 0:
+                    ax.plot([pm, pm], [round_idx - 0.3, round_idx + 0.3],
+                            color="red", lw=1.2, alpha=0.6)
+
+            ax.set_title(label, fontsize=8)
+            ax.set_yticks(range(len(entries)))
+            ax.set_yticklabels([str(i) for i in range(len(entries))], fontsize=6)
+            ax.grid(True, alpha=0.2, axis="x")
+            ax.invert_yaxis()
+
+            if col == 0:
+                ax.set_ylabel(group_label, fontsize=9)
+            if row == nrows - 1:
+                ax.set_xlabel("Token position")
+
+    fig.suptitle(f"Checkpoint positions — conv: {target_conv}\n"
+                 f"(dots = checkpoints, red line = prefix match) — {model_name}",
+                 fontsize=10)
+    plt.tight_layout()
+    out = out_dir / "checkpoint_positions.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"  saved {out}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Plot 3: Why distribution-aware methods lose — GDN gap analysis
+# ---------------------------------------------------------------------------
+def plot_gdn_gap(out_dir, root_dir=None, style_map=None, **_kw):
+    """Show how much GDN reuse each strategy wastes relative to KV prefix match.
+
+    prefix_match is identical across strategies (determined by data).
+    reusable_gdn depends on checkpoint placement.
+    The gap = prefix_match - reusable_gdn = wasted GDN recompute.
+    """
+    out_dir = Path(out_dir)
+    root_dir = Path(root_dir) if root_dir else out_dir
+    data_dir = root_dir / "benchmark_e2e"
+    summary_path = data_dir / "e2e_summary.json"
+    if not summary_path.exists():
+        print(f"  skipping gdn_gap ({summary_path} not found)")
+        return
+
+    summary = json.loads(summary_path.read_text())
+    model_name = summary["model_name"]
+    strat_keys = list(summary["strategies"].keys())
+
+    per_request = {}
+    for strat in strat_keys:
+        jsonl = data_dir / f"e2e_{strat}.jsonl"
+        if jsonl.exists():
+            per_request[strat] = _load_jsonl(jsonl)
+
+    sidx = _build_style_index(summary)
+    show = _sort_strategies_by_budget(
+        [s for s in strat_keys if s in per_request and s not in ("no_cache", "kv_only")], sidx)
+    if not show:
+        return
+
+    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(20, 6))
+
+    # Panel 1: Boxplot of GDN efficiency = reusable_gdn / prefix_match
+    efficiencies = {}
+    for s in show:
+        eff = []
+        for e in per_request[s]:
+            pm = e["prefix_match"]
+            if pm > 0:
+                eff.append(e["reusable_gdn"] / pm)
+        efficiencies[s] = eff
+
+    labels_eff = [_spec(s, style_map)[0].replace(' ', '\n', 1) for s in show]
+    colors_eff = [_spec(s, style_map)[1] for s in show]
+    bp = ax1.boxplot(
+        [efficiencies[s] for s in show],
+        labels=labels_eff, patch_artist=True, showfliers=False,
+        flierprops=dict(markersize=2, alpha=0.5),
+    )
+    for patch, c in zip(bp["boxes"], colors_eff):
+        patch.set_facecolor(c)
+        patch.set_alpha(0.6)
+    ax1.set_ylabel("GDN efficiency (reusable_gdn / prefix_match)")
+    ax1.set_title("Checkpoint placement efficiency")
+    ax1.axhline(1.0, color="black", ls="--", lw=0.8, alpha=0.4)
+    ax1.grid(True, alpha=0.3, axis="y")
+    ax1.tick_params(axis="x", rotation=45, labelsize=7)
+
+    # Panel 2: Scatter — number of checkpoints vs GDN efficiency
+    for s in show:
+        label, color, marker, *_ = _spec(s, style_map)
+        n_ckpts = []
+        effs = []
+        for e in per_request[s]:
+            pm = e["prefix_match"]
+            if pm > 0:
+                n_ckpts.append(len(e["added_positions"]))
+                effs.append(e["reusable_gdn"] / pm)
+        ax2.scatter(n_ckpts, effs, s=10, alpha=0.3, color=color, label=label)
+    ax2.set_xlabel("# checkpoints placed")
+    ax2.set_ylabel("GDN efficiency")
+    ax2.set_title("More checkpoints → better GDN coverage?")
+    ax2.legend(fontsize=6, loc="lower right")
+    ax2.grid(True, alpha=0.3)
+    ax2.axhline(1.0, color="black", ls="--", lw=0.8, alpha=0.4)
+
+    # Panel 3: Gap (prefix_match - reusable_gdn) as fraction of seq_len
+    gap_fracs = {}
+    for s in show:
+        gaps = []
+        for e in per_request[s]:
+            sl = e["seq_len"]
+            gap = e["prefix_match"] - e["reusable_gdn"]
+            gaps.append(gap / sl if sl > 0 else 0)
+        gap_fracs[s] = gaps
+
+    bp3 = ax3.boxplot(
+        [gap_fracs[s] for s in show],
+        labels=labels_eff, patch_artist=True, showfliers=False,
+    )
+    for patch, c in zip(bp3["boxes"], colors_eff):
+        patch.set_facecolor(c)
+        patch.set_alpha(0.6)
+    ax3.set_ylabel("Wasted GDN fraction (gap / seq_len)")
+    ax3.set_title("GDN recompute waste per request")
+    ax3.grid(True, alpha=0.3, axis="y")
+    ax3.tick_params(axis="x", rotation=45, labelsize=7)
+
+    fig.suptitle(f"GDN gap analysis — why distribution-aware may underperform — {model_name}",
+                 fontsize=11)
+    plt.tight_layout()
+    out = out_dir / "gdn_gap_analysis.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"  saved {out}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
+# Plot 4: Cache size breakdown — KV vs GDN over time per strategy
+# ---------------------------------------------------------------------------
+def plot_cache_breakdown(out_dir, root_dir=None, style_map=None, **_kw):
+    """Plot cache_kv_bytes and cache_gdn_bytes over request index for each strategy."""
+    out_dir = Path(out_dir)
+    root_dir = Path(root_dir) if root_dir else out_dir
+    data_dir = root_dir / "benchmark_e2e"
+    summary_path = data_dir / "e2e_summary.json"
+    if not summary_path.exists():
+        print(f"  skipping cache_breakdown ({summary_path} not found)")
+        return
+
+    summary = json.loads(summary_path.read_text())
+    model_name = summary["model_name"]
+    strat_keys = list(summary["strategies"].keys())
+
+    per_request = {}
+    for strat in strat_keys:
+        jsonl = data_dir / f"e2e_{strat}.jsonl"
+        if jsonl.exists():
+            per_request[strat] = _load_jsonl(jsonl)
+
+    show = [s for s in strat_keys if s in per_request and s not in ("no_cache",)]
+    if not show:
+        return
+
+    sidx = _build_style_index(summary)
+    groups = _group_strategies_by_budget(show, sidx)
+    groups = [(lbl, [s for s in strats if s in per_request])
+              for lbl, strats in groups]
+    groups = [(lbl, strats) for lbl, strats in groups if strats]
+
+    nrows = len(groups)
+    ncols = max(len(strats) for _, strats in groups)
+    fig, axes = plt.subplots(nrows, ncols, figsize=(5 * ncols, 3 * nrows),
+                             squeeze=False, sharey=True)
+
+    first_ax = None
+    for row, (group_label, strats) in enumerate(groups):
+        for col in range(ncols):
+            ax = axes[row][col]
+            if col >= len(strats):
+                ax.set_visible(False)
+                continue
+
+            strat = strats[col]
+            entries = per_request[strat]
+            label, color, *_ = _spec(strat, style_map)
+
+            req_idx = np.arange(len(entries))
+            kv_gb = np.array([e.get("cache_kv_bytes", 0) for e in entries]) / 1e9
+            gdn_gb = np.array([e.get("cache_gdn_bytes", 0) for e in entries]) / 1e9
+            n_entries = np.array([e.get("n_cache_entries", 0) for e in entries])
+
+            ax.fill_between(req_idx, 0, kv_gb, alpha=0.4, color="tab:red", label="KV cache")
+            ax.fill_between(req_idx, kv_gb, kv_gb + gdn_gb, alpha=0.4, color="tab:green", label="GDN ckpts")
+            ax.set_title(label, fontsize=9)
+            ax.grid(True, alpha=0.3)
+
+            ax2t = ax.twinx()
+            ax2t.plot(req_idx, n_entries, color="gray", lw=0.8, alpha=0.5, ls="--")
+            ax2t.set_ylabel("# entries", fontsize=7, color="gray")
+            ax2t.tick_params(axis="y", labelcolor="gray", labelsize=6)
+
+            if col == 0:
+                ax.set_ylabel(f"{group_label}\nGB", fontsize=8)
+            if first_ax is None:
+                ax.legend(fontsize=7, loc="upper left")
+                first_ax = ax
+
+    fig.suptitle(f"Cache memory breakdown (KV vs GDN) — {model_name}", fontsize=12)
+    plt.tight_layout()
+    out = out_dir / "cache_breakdown.png"
+    plt.savefig(out, dpi=200, bbox_inches="tight")
+    print(f"  saved {out}")
+    plt.close()
+
+
+# ---------------------------------------------------------------------------
 # Composite targets
 # ---------------------------------------------------------------------------
 def plot_all(out_dir, root_dir=None, style_map=None, **_kw):
@@ -735,6 +1176,10 @@ def plot_all(out_dir, root_dir=None, style_map=None, **_kw):
     plot_e2e(out_dir, root_dir=root_dir, style_map=style_map)
     plot_overlap(out_dir, root_dir=root_dir)
     plot_trie_diagnostics(out_dir, root_dir=root_dir, style_map=style_map)
+    plot_lcp_over_rounds(out_dir, root_dir=root_dir, style_map=style_map)
+    plot_checkpoint_positions(out_dir, root_dir=root_dir, style_map=style_map)
+    plot_gdn_gap(out_dir, root_dir=root_dir, style_map=style_map)
+    plot_cache_breakdown(out_dir, root_dir=root_dir, style_map=style_map)
 
 
 # ---------------------------------------------------------------------------

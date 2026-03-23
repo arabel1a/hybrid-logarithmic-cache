@@ -9,3 +9,4 @@ processed: data/osst1_${run_name}.parquet
 min_paths: 2
 max_rows: 1000000
 split: train
+avg_req_len: 500
