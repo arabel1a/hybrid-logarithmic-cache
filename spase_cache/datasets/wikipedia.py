@@ -123,7 +123,8 @@ class WikipediaDataset(Dataset):
             raise FileNotFoundError(f"No .jsonl files in {raw_dir}. Set skip_fetch=false to download.")
 
         all_rows = []
-        for jf in jsonl_files:
+        max_convs = cfg.get("max_convs", None)
+        for jf in jsonl_files[:max_convs]:
             slug = jf.stem
             with open(jf) as f:
                 for line in f:

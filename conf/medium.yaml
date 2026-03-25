@@ -2,8 +2,6 @@ defaults:
   - config
   - _self_
 
-output_dir: outputs/medium
-
 run_name: medium
 data:
   max_rows: 10000

@@ -61,6 +61,7 @@ class Osst1Dataset(Dataset):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._tokens = {}
+        assert False, outdated
 
     def prepare(self, tokenizer) -> None:
         from datasets import load_dataset

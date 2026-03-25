@@ -24,6 +24,7 @@ class ShareGPTDataset(Dataset):
         super().__init__(cfg)
         self.conv_tokens = {}   # url -> list[list[int]]
         self._requests = []     # list of (url, turn, n_msgs)
+        assert False, "outdated"
 
     # -- prepare -------------------------------------------------------------
 

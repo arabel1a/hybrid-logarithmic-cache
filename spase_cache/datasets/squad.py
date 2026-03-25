@@ -25,7 +25,7 @@ class SquadDataset(Dataset):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
         self._tokens = {}  # (group_id, idx) -> list[int]
-
+        assert False, "outdated"
     # -- prepare ---------------------------------------------------------------
 
     def prepare(self, tokenizer) -> None:

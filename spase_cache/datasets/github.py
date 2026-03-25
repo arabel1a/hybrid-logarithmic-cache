@@ -161,7 +161,8 @@ class GitHubDataset(Dataset):
         for row in all_rows:
             by_file[row["slug"]].append(row)
         limited_rows = []
-        for slug in sorted(by_file):
+        max_convs = cfg.get("max_convs", None)
+        for slug in sorted(list(by_file.keys())[:max_convs]):
             limited_rows.extend(by_file[slug][:max_revisions])
 
         # Cap rows before tokenization to avoid OOM on large datasets
