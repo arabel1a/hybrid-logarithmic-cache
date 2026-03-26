@@ -1,6 +1,7 @@
 """Caching strategy for prefix checkpoint evaluation."""
 import logging
 import math
+from functools import lru_cache
 import numpy as np
 
 log = logging.getLogger(__name__)
@@ -74,29 +75,24 @@ def checkpoint_positions(seq_len, *, type, block_size=None, n_blocks=None, start
 # DP-optimal checkpoint placement (Corollary 1 from the paper)
 # ---------------------------------------------------------------------------
 def solve_dp(hist, budget):
-    """Solve the optimal checkpoint placement DP (vectorized).
+    """Solve the DP forward pass (vectorized).
 
     Given overlap histogram `hist` (array of length N+1 where hist[t] = weight
-    of overlap depth t, t=0..N), and checkpoint budget M, returns list of optimal
-    checkpoint positions (0-indexed bin indices).
+    of overlap depth t, t=0..N), and checkpoint budget M, fills the DP table.
 
-    DP recurrence (paper Corollary 1):
-        dp[0, j] = sum_{t=1}^{j} p_t * t
-        dp[m, j] = min_{1<=s<=j} (dp[m-1, s-1] + w(s, j))
-    where w(s, j) = sum_{t=s}^{j} p_t * (t - s)
-
-    Returns sorted list of checkpoint positions (1-indexed into bins).
+    Returns (all_back, N, M) where all_back[m][j] stores the optimal split
+    point for m checkpoints covering positions 1..j. Returns None if no
+    meaningful solution (empty hist or zero budget).
     """
     N = len(hist) - 1  # hist[0..N], positions 1..N
-    M = min(budget, N)  # can't place more checkpoints than positions
+    M = min(budget, N)
     if N <= 0 or M <= 0:
-        return []
+        return None
 
     p = np.array(hist, dtype=np.float64)
     total = p.sum()
     if total < 1e-12:
-        block = max(1, N // (M + 1))
-        return list(range(block, N + 1, block))[:M]
+        return None
     p = p / total
 
     cum_p = np.zeros(N + 2)
@@ -125,9 +121,15 @@ def solve_dp(hist, budget):
         dp_prev = dp_curr
         all_back.append(back_curr)
 
+    return all_back, N, M
+
+
+def backtrack(all_back, M, j):
+    """Backtrack from dp[M, j] to recover checkpoint positions (bin indices)."""
     positions = []
-    j = N
     for m in range(M, 0, -1):
+        if j <= 0:
+            break
         s = int(all_back[m][j])
         positions.append(s)
         j = s - 1
@@ -180,7 +182,7 @@ class HistogramTracker:
         n_bins = max_len // self.bin_size + 1
         self.counts = np.zeros(n_bins, dtype=np.float64)
         self.n_obs = 0
-        self._positions = None  # cached DP solution (in token positions)
+        self._dp_result = None  # (all_back, N, M) from solve_dp
         self._dirty = True
         self._n_solves = 0
         self.histogram_log = []  # list of {n_obs, counts}
@@ -196,24 +198,37 @@ class HistogramTracker:
         self._dirty = True
 
     def solve(self):
-        """Solve DP on current (binned) histogram and cache the result."""
+        """Solve DP on current (binned) histogram and store full DP tables."""
         self.histogram_log.append({
             "n_obs": self.n_obs,
             "counts": self.counts.copy(),
         })
         smoothed = laplace_smoothing(self.counts, self.alpha)
-        bin_positions = solve_dp(smoothed, self.budget)
-        self._positions = [_bin_to_pos(b, self.bin_size) for b in bin_positions]
+        self._dp_result = solve_dp(smoothed, self.budget)
+        if self._dp_result is None:
+            # degenerate histogram — balanced fallback will be used
+            log.info("DP solve: degenerate histogram, using balanced fallback")
+        else:
+            _, N, M = self._dp_result
+            positions = self._backtrack_bins(N)
+            log.info("DP solved: %d ckpts, n_obs=%d, bin_size=%d, positions=%s",
+                     len(positions), self.n_obs, self.bin_size,
+                     [_bin_to_pos(b, self.bin_size) for b in positions])
+        self._backtrack_bins.cache_clear()
         self._n_solves += 1
         self._dirty = False
-        log.info("DP solved: %d ckpts, n_obs=%d, bin_size=%d, positions=%s",
-                 len(self._positions), self.n_obs, self.bin_size, self._positions)
+
+    @lru_cache(maxsize=256)
+    def _backtrack_bins(self, j_bin):
+        """Backtrack from bin index j_bin, returning bin-level positions."""
+        all_back, N, M = self._dp_result
+        j = min(j_bin, N)
+        return backtrack(all_back, M, j)
 
     def get_positions(self, seq_len):
         """Get checkpoint positions for a request of given length."""
-        if self._positions is None:
+        if self._dp_result is None:
             # No DP solution yet — use balanced fallback until first solve
-            # (first solve is triggered at end of warmup, like frozen)
             block = max(1, seq_len // (self.budget + 1))
             return list(range(block, seq_len + 1, block))[:self.budget]
 
@@ -227,7 +242,9 @@ class HistogramTracker:
         if should_solve:
             self.solve()
 
-        return [p for p in self._positions if 0 < p <= seq_len]
+        j_bin = seq_len // self.bin_size
+        bin_positions = self._backtrack_bins(j_bin)
+        return [_bin_to_pos(b, self.bin_size) for b in bin_positions if 0 < b <= j_bin]
 
     def freeze(self):
         """Solve and freeze — no further updates to positions."""
