@@ -28,6 +28,7 @@ from spase_cache.utils import (
     _sync_device,
     prefill_and_capture_at,
     PrefixCache,
+    FixedSizeCache,
     _save_jsonl,
 )
 from spase_cache.strategies import checkpoint_positions, HistogramTracker
@@ -38,6 +39,12 @@ log = logging.getLogger(__name__)
 def _make_dataset(cfg) -> Dataset:
     cls = hydra.utils.get_class(cfg.data._target_)
     return cls(cfg=cfg.data)
+
+
+def _make_cache(cfg):
+    """Instantiate cache manager from config."""
+    cls = hydra.utils.get_class(cfg.cache_manager._target_)
+    return cls(**{k: v for k, v in cfg.cache_manager.items() if k != "_target_"})
 
 
 def _is_histogram_strategy(stype):
@@ -61,15 +68,12 @@ def _make_histogram_tracker(strategy, max_len):
                             replan_interval=replan_interval, bin_size=bin_size)
 
 
-def warmup_cache(model, dataset, requests, vocab_size, strategy,
-                 kv_budget, gdn_budget, cache=None, progress=False,
-                 histogram_tracker=None):
+def warmup_cache(model, dataset, requests, vocab_size, strategy, cache,
+                 progress=False, histogram_tracker=None):
     """Run requests through the model to fill the cache, without timing."""
     dev = _model_device(model)
     uses_cache = strategy.type != "no_cache"
     is_hist = _is_histogram_strategy(strategy.type)
-    if cache is None:
-        cache = PrefixCache(kv_budget, gdn_budget)
 
     for req in tqdm(requests, desc=f"{strategy.tag} warmup", disable=not progress):
         conv_id = dataset.conv_id(req)
@@ -77,7 +81,8 @@ def warmup_cache(model, dataset, requests, vocab_size, strategy,
         input_ids = torch.tensor([all_toks], dtype=torch.long) % vocab_size
         seq_len = input_ids.shape[1]
 
-        cached_store, match_len = cache.find_best_prefix(conv_id, input_ids[0])
+        cached_store, match_len = (cache.find_best_prefix(conv_id, input_ids[0])
+                                   if uses_cache else (None, 0))
         input_ids = input_ids.to(dev)
         if is_hist and histogram_tracker is not None:
             histogram_tracker.observe(match_len)
@@ -87,11 +92,12 @@ def warmup_cache(model, dataset, requests, vocab_size, strategy,
         else:
             prefill_baseline(model, input_ids)
         _sync_device(dev)
-        positions = checkpoint_positions(seq_len, histogram_tracker=histogram_tracker, **strategy)
-        store = prefill_and_capture_at(model, input_ids, positions)
-        _sync_device(dev)
-        store.to("cpu")
-        cache.put(conv_id, store)
+        if uses_cache:
+            positions = checkpoint_positions(seq_len, histogram_tracker=histogram_tracker, **strategy)
+            store = prefill_and_capture_at(model, input_ids, positions)
+            _sync_device(dev)
+            store.to("cpu")
+            cache.put(conv_id, store)
 
     if is_hist and histogram_tracker is not None:
         if strategy.type == 'histogram_frozen':
@@ -101,19 +107,17 @@ def warmup_cache(model, dataset, requests, vocab_size, strategy,
             # but keep the mode for online re-solving during simulate.
             histogram_tracker.solve()
 
-    return cache if uses_cache else PrefixCache(kv_budget, gdn_budget)
+    return cache
 
 
 def simulate(model, dataset, requests, vocab_size, strategy,
-             kv_budget, gdn_budget, cache=None, progress=False,
+             cache, progress=False,
              histogram_tracker=None):
     """Run all requests through the model with given caching strategy."""
     dev = _model_device(model)
     uses_cache = strategy.type != "no_cache"
     is_hist = _is_histogram_strategy(strategy.type)
     online_hist = is_hist and strategy.type != 'histogram_frozen'
-    if cache is None and uses_cache:
-        cache = PrefixCache(kv_budget, gdn_budget)
     per_request = []
     wall_t0 = time.perf_counter()
 
@@ -178,9 +182,9 @@ def simulate(model, dataset, requests, vocab_size, strategy,
             "tokens_saved": tokens_saved,
             "reusable_kv": reusable_kv, "reusable_gdn": reusable_gdn,
             "prefix_match": match_len,
-            "n_cache_entries": cache.n_entries if cache else 0,
-            "cache_kv_bytes": cache.kv_used if cache else 0,
-            "cache_gdn_bytes": cache.gdn_used if cache else 0,
+            "n_cache_entries": cache.n_entries,
+            "cache_kv_bytes": cache.kv_used,
+            "cache_gdn_bytes": cache.gdn_used,
         })
 
     wall_time = time.perf_counter() - wall_t0
@@ -191,26 +195,26 @@ def simulate(model, dataset, requests, vocab_size, strategy,
         "hits": sum(1 for e in per_request if e["hit"]),
         "tokens_saved": sum(e["tokens_saved"] for e in per_request),
         "tokens_total": sum(e["seq_len"] for e in per_request),
-        "cache_entries": cache.n_entries if cache else 0,
+        "cache_stats": cache.stats(),
         "per_request": per_request,
     }
 
 
 def run_strategy(model, dataset, strat, train_requests, test_requests,
-                 vocab_size, kv_budget, gdn_budget,
-                 max_seq_len, progress):
+                 vocab_size, cfg, max_seq_len, progress):
     """Run a single strategy end-to-end. All caches are local and freed on return."""
     hist_tracker = None
     if _is_histogram_strategy(strat.type):
         hist_tracker = _make_histogram_tracker(strat, max_seq_len)
 
+    cache = _make_cache(cfg)
     log.info("Strategy: %s — warming cache on train split...", strat.tag)
     cache = warmup_cache(model, dataset, train_requests, vocab_size,
-                         strat, kv_budget, gdn_budget, progress=progress,
+                         strat, cache, progress=progress,
                          histogram_tracker=hist_tracker)
     log.info("Strategy: %s — evaluating on test split...", strat.tag)
     res = simulate(model, dataset, test_requests, vocab_size,
-                   strat, kv_budget, gdn_budget, cache=cache, progress=progress,
+                   strat, cache, progress=progress,
                    histogram_tracker=hist_tracker)
 
     log.info("  %s: prefill=%.1fs capture=%.1fs wall=%.1fs",
@@ -236,8 +240,6 @@ def main(cfg: DictConfig):
     config = model.config
     e2e = cfg.benchmark_e2e
     strategies = list(cfg.strategies)
-    kv_budget = int(e2e.kv_budget_gb * 1e9)
-    gdn_budget = int(e2e.gdn_budget_gb * 1e9)
     progress = e2e.get("progress", True)
     vocab_size = config.vocab_size
 
@@ -247,9 +249,9 @@ def main(cfg: DictConfig):
     train_requests, test_requests = dataset.train_test_split()
 
     total_tokens = sum(len(dataset.get_tokens(r)) for r in test_requests)
-    log.info("Train: %d, Test: %d requests, test tokens: %d, KV budget: %.1f GB, GDN budget: %.1f GB",
+    log.info("Train: %d, Test: %d requests, test tokens: %d, cache: %s",
              len(train_requests), len(test_requests), total_tokens,
-             e2e.kv_budget_gb, e2e.gdn_budget_gb)
+             cfg.cache_manager._target_)
 
     summary = {
         "model_name": cfg.model.name,
@@ -257,8 +259,7 @@ def main(cfg: DictConfig):
         "n_test_requests": len(test_requests),
         "total_tokens": total_tokens,
         "train_frac": cfg.data.get("train_frac", 0.5),
-        "kv_budget_gb": e2e.kv_budget_gb,
-        "gdn_budget_gb": e2e.gdn_budget_gb,
+        "cache_manager_config": OmegaConf.to_container(cfg.cache_manager, resolve=True),
         "strategies": {},
         "strategy_styles": OmegaConf.to_container(cfg.strategies, resolve=True),
     }
@@ -266,14 +267,15 @@ def main(cfg: DictConfig):
 
     # initial warmup to alleviate gpu clock control, etc
     print("Warming up cores")
+    cache = _make_cache(cfg)
     cache = warmup_cache(model, dataset, train_requests[:e2e.warmup_seqs], vocab_size,
-                   strategies[0], kv_budget, gdn_budget, progress=progress)
+                   strategies[0], cache, progress=progress)
     simulate(model, dataset, test_requests[:e2e.warmup_seqs], vocab_size,
-                    strategies[0], kv_budget, gdn_budget, cache=cache, progress=progress)
+                    strategies[0], cache, progress=progress)
 
     for strat in strategies:
         res = run_strategy(model, dataset, strat, train_requests, test_requests,
-                           vocab_size, kv_budget, gdn_budget,
+                           vocab_size, cfg,
                            cfg.data.max_seq_len, progress)
 
         _save_jsonl(out_dir / f"e2e_{strat.tag}.jsonl", res["per_request"])
@@ -292,7 +294,7 @@ def main(cfg: DictConfig):
             "hits": res["hits"],
             "tokens_saved": res["tokens_saved"],
             "tokens_total": res["tokens_total"],
-            "cache_entries": res["cache_entries"],
+            "cache_stats": res["cache_stats"],
         }
         summary_path.write_text(json.dumps(summary, indent=2))
 

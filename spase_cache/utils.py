@@ -439,9 +439,9 @@ class PrefixCache:
     entry for a given conv_id whose prefix_tokens best matches the query.
     """
 
-    def __init__(self, kv_budget_bytes, gdn_budget_bytes):
-        self.kv_budget = kv_budget_bytes
-        self.gdn_budget = gdn_budget_bytes
+    def __init__(self, kv_budget_gb, gdn_budget_gb, **ignored):
+        self.kv_budget = int(kv_budget_gb * 1e9)
+        self.gdn_budget = int(gdn_budget_gb * 1e9)
         self.kv_used = 0
         self.gdn_used = 0
         self.entries = OrderedDict()  # (conv_id, seq_id) -> (store, kv_bytes, gdn_bytes)
@@ -511,3 +511,79 @@ class PrefixCache:
     @property
     def used(self):
         return self.kv_used + self.gdn_used
+
+    def stats(self):
+        return {
+            "type": "PrefixCache",
+            "n_entries": self.n_entries,
+            "kv_budget_gb": self.kv_budget / 1e9,
+            "gdn_budget_gb": self.gdn_budget / 1e9,
+            "kv_used_gb": self.kv_used / 1e9,
+            "gdn_used_gb": self.gdn_used / 1e9,
+        }
+
+
+class FixedSizeCache:
+    """Simple FIFO cache that stores exactly up to max_sequences entries.
+
+    No memory budget tracking — just evicts oldest when full.
+    """
+
+    def __init__(self, max_cached_sequences, **ignored):
+        self.max_sequences = max_cached_sequences
+        self.entries = OrderedDict()  # (conv_id, seq_id) -> store
+        self._conv_entries = defaultdict(list)
+        self._next_id = 0
+
+    def find_best_prefix(self, conv_id, input_ids):
+        best_store = None
+        best_len = 0
+        for key in self._conv_entries.get(conv_id, []):
+            if key not in self.entries:
+                continue
+            store = self.entries[key]
+            if store.prefix_tokens is None:
+                continue
+            ml = _prefix_match_len(store.prefix_tokens, input_ids)
+            if ml > best_len:
+                best_len = ml
+                best_store = store
+        return best_store, best_len
+
+    def put(self, conv_id, store, _size_bytes=None):
+        while self.entries and len(self.entries) >= self.max_sequences:
+            evicted_key, _ = self.entries.popitem(last=False)
+            ecid = evicted_key[0]
+            if ecid in self._conv_entries:
+                try:
+                    self._conv_entries[ecid].remove(evicted_key)
+                except ValueError:
+                    pass
+                if not self._conv_entries[ecid]:
+                    del self._conv_entries[ecid]
+
+        key = (conv_id, self._next_id)
+        self._next_id += 1
+        self.entries[key] = store
+        self._conv_entries[conv_id].append(key)
+
+    @property
+    def n_entries(self):
+        return len(self.entries)
+
+    @property
+    def kv_used(self):
+        return sum(s.kv_bytes() for s in self.entries.values())
+
+    @property
+    def gdn_used(self):
+        return sum(s.gdn_bytes() for s in self.entries.values())
+
+    def stats(self):
+        return {
+            "type": "FixedSizeCache",
+            "n_entries": self.n_entries,
+            "max_cached_sequences": self.max_sequences,
+            "kv_used_gb": self.kv_used / 1e9,
+            "gdn_used_gb": self.gdn_used / 1e9,
+        }

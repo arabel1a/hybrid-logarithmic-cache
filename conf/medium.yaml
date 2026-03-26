@@ -11,6 +11,6 @@ data:
 benchmark_baselines:
   seq_lens: [1024, 4096, 16384]
 
-benchmark_e2e:
+cache_manager:
   kv_budget_gb: 8
   gdn_budget_gb: 2

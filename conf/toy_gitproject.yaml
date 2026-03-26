@@ -24,8 +24,10 @@ data:
 benchmark_baselines:
   seq_lens: [1024, 2048, 4096, 8192, 16384]
 
-benchmark_e2e:
+cache_manager:
   kv_budget_gb: 1.0
   gdn_budget_gb: 1.0
+
+benchmark_e2e:
   warmup_seqs: 10
   progress: true

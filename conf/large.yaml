@@ -9,6 +9,6 @@ data:
   max_rows: 100000
  max_requests: 10000
 
-benchmark_e2e:
+cache_manager:
   kv_budget_gb: 5
-  gdn_budget_gb: 5 
+  gdn_budget_gb: 5
