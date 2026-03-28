@@ -74,6 +74,7 @@ cache_manager:
 benchmark_e2e:
   warmup_seqs: 1000
   progress: true
+  dry_run: false
 
 overlap_distribution:
   batch_size: 5000

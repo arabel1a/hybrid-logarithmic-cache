@@ -22,6 +22,7 @@ def balanced_positions(seq_len, block_size=None, n_blocks=None):
     assert (block_size is None) != (n_blocks is None)
     if n_blocks is not None:
         block_size = seq_len // (n_blocks + 1)
+        return list(range(block_size, seq_len + 1, block_size))[:n_blocks]
     return list(range(block_size, seq_len + 1, block_size))
 
 def sqrt_positions(seq_len):

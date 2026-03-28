@@ -587,3 +587,29 @@ class FixedSizeCache:
             "kv_used_gb": self.kv_used / 1e9,
             "gdn_used_gb": self.gdn_used / 1e9,
         }
+
+
+class DryRunStore:
+    """Lightweight fake store for dry-run simulation — no tensors, just metadata."""
+    def __init__(self, prefix_tokens, positions, kv_bytes_per_tok, gdn_bytes_per_ckpt):
+        self.prefix_tokens = prefix_tokens
+        self.kv_len = len(prefix_tokens)
+        self._positions = sorted(positions)
+        self._kv_bytes = kv_bytes_per_tok * self.kv_len
+        self._gdn_bytes = gdn_bytes_per_ckpt * len(positions)
+
+    def best_checkpoint(self, seq_len):
+        best = None
+        for p in self._positions:
+            if p <= seq_len:
+                best = p
+        return best
+
+    def kv_bytes(self):
+        return self._kv_bytes
+
+    def gdn_bytes(self):
+        return self._gdn_bytes
+
+    def to(self, device):
+        return self

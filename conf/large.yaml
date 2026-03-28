@@ -2,13 +2,9 @@ defaults:
   - config
   - _self_
 
-output_dir: outputs/large
-
 run_name: large
 data:
   max_rows: 100000
- max_requests: 10000
+  max_requests: 10000
+  max_convs: 100
 
-cache_manager:
-  kv_budget_gb: 5
-  gdn_budget_gb: 5
