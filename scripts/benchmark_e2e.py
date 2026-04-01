@@ -96,16 +96,13 @@ def simulate_dry(dataset, requests, vocab_size, strategy, cache,
             store = DryRunStore(input_ids, positions, kv_bytes_per_tok, gdn_bytes_per_ckpt)
             cache.put(conv_id, store)
 
-        tokens_to_process = seq_len - tokens_saved
-        dt = tokens_to_process * 0.05  # 1 token ≈ 50ms
+        dt = (seq_len - tokens_saved) * 0.05  # 1 token ≈ 50ms
 
         per_request.append({
             "conv_id": str(conv_id), "seq_len": seq_len,
             "added_positions": positions,
-            "seq_len": seq_len,
             "time_s": dt, "capture_s": 0.0, "hit": hit,
             "tokens_saved": tokens_saved,
-            "tokens_to_process": tokens_to_process,
             "reusable_kv": reusable_kv, "reusable_gdn": reusable_gdn,
             "prefix_match": match_len,
             "n_cache_entries": cache.n_entries,
@@ -143,10 +140,10 @@ def _make_histogram_tracker(strategy, max_len):
             'histogram_periodic': 'periodic',
             'histogram_exp_decay': 'exp_decay'}[stype]
     budget = strategy.n_blocks
-    gamma = strategy.get('gamma', 0.99)
+    gamma = strategy['gamma']
     laplace_alpha = strategy.laplace_alpha
-    replan_interval = strategy.get('replan_interval', 100)
-    bin_size = strategy.get('bin_size', 1)
+    replan_interval = strategy['replan_interval']
+    bin_size = strategy['bin_size']
     log.info("histogram %s [%s]: budget=%d, bin_size=%d, max_len=%d",
              strategy.tag, stype, budget, bin_size, max_len)
     return HistogramTracker(max_len, budget, mode=mode, gamma=gamma, alpha=laplace_alpha,
@@ -262,7 +259,6 @@ def simulate(model, dataset, requests, vocab_size, strategy,
         per_request.append({
             "conv_id": str(conv_id), "seq_len": seq_len,
             "added_positions": positions,
-            "seq_len": seq_len,
             "time_s": dt, "capture_s": capture_s, "hit": hit,
             "tokens_saved": tokens_saved,
             "reusable_kv": reusable_kv, "reusable_gdn": reusable_gdn,
@@ -295,11 +291,11 @@ def run_strategy(model, dataset, strat, train_requests, test_requests,
     cache = _make_cache(cfg)
     log.info("Strategy: %s — warming cache on train split...", strat.tag)
     cache = warmup_cache(model, dataset, train_requests, vocab_size,
-                         strat, cache, progress=progress,
+                         strat, cache, progress=e2e.progress,
                          histogram_tracker=hist_tracker)
     log.info("Strategy: %s — evaluating on test split...", strat.tag)
     res = simulate(model, dataset, test_requests, vocab_size,
-                   strat, cache, progress=progress,
+                   strat, cache, progress=e2e.progress,
                    histogram_tracker=hist_tracker)
 
     log.info("  %s: prefill=%.1fs capture=%.1fs wall=%.1fs",
@@ -358,9 +354,8 @@ def main(cfg: DictConfig):
     out_dir = setup_output_dir(cfg, "benchmark_e2e")
     resolve_strategies(cfg)
     e2e = cfg.benchmark_e2e
-    dry_run = e2e.get("dry_run", False)
+    dry_run = e2e.dry_run
     strategies = list(cfg.strategies)
-    progress = e2e.get("progress", True)
 
     if dry_run:
         vocab_size = cfg.model.vocab_size
@@ -384,7 +379,7 @@ def main(cfg: DictConfig):
         "n_train_requests": len(train_requests),
         "n_test_requests": len(test_requests),
         "total_tokens": total_tokens,
-        "train_frac": cfg.data.get("train_frac", 0.5),
+        "train_frac": cfg.data.train_frac,
         "cache_manager_config": OmegaConf.to_container(cfg.cache_manager, resolve=True),
         "strategies": {},
         "strategy_styles": OmegaConf.to_container(cfg.strategies, resolve=True),
@@ -396,17 +391,17 @@ def main(cfg: DictConfig):
         print("Warming up cores")
         cache = _make_cache(cfg)
         cache = warmup_cache(model, dataset, train_requests[:e2e.warmup_seqs], vocab_size,
-                       strategies[0], cache, progress=progress)
+                       strategies[0], cache, progress=e2e.progress)
         simulate(model, dataset, test_requests[:e2e.warmup_seqs], vocab_size,
-                        strategies[0], cache, progress=progress)
+                        strategies[0], cache, progress=e2e.progress)
 
     for strat in strategies:
         if dry_run:
             res = run_strategy_dry(dataset, strat, train_requests, test_requests,
-                                   vocab_size, cfg, cfg.data.max_seq_len, progress)
+                                   vocab_size, cfg, cfg.data.max_seq_len, e2e.progress)
         else:
             res = run_strategy(model, dataset, strat, train_requests, test_requests,
-                               vocab_size, cfg, cfg.data.max_seq_len, progress)
+                               vocab_size, cfg, cfg.data.max_seq_len, e2e.progress)
 
         _save_jsonl(out_dir / f"e2e_{strat.tag}.jsonl", res["per_request"])
         if "histogram_log" in res:

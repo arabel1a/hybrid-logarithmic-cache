@@ -1,15 +1,14 @@
 defaults:
-  - _self_
   - base
+  - _self_
 
-_target_: spase_cache.datasets.wikipedia.WikipediaDataset
+_target_: spase_cache.datasets.revisions.WikipediaDataset
 name: wikipedia
 format: revision
 raw_dir: data/wikipedia
 processed: data/wikipedia_${run_name}.parquet
 max_revisions: 100    # max revisions per article
 skip_fetch: True # false
-avg_req_len: 10000
 
 fetch:
   max_revisions: 500

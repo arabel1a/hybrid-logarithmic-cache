@@ -40,13 +40,12 @@ class SingleDocQADataset(Dataset):
         cfg = self.cfg
         rows = self._load_raw()
 
-        max_rows = cfg.get("max_rows", len(rows))
-        if len(rows) > max_rows:
-            rows = rows[:max_rows]
-            log.info("Capped to %d rows (max_rows)", max_rows)
+        if len(rows) > cfg.max_rows:
+            rows = rows[:cfg.max_rows]
+            log.info("Capped to %d rows (max_rows)", cfg.max_rows)
 
         # Tokenize
-        chunk_size = cfg.get("tokenizer_chunk_size", 16)
+        chunk_size = cfg.tokenizer_chunk_size
         texts = [r["text"] for r in rows]
         all_tokens = []
         for i in tqdm(range(0, len(texts), chunk_size), desc="tokenizing"):
@@ -62,11 +61,9 @@ class SingleDocQADataset(Dataset):
             "n_tokens": [len(t) for t in all_tokens],
         })
 
-        min_seq_len = cfg.get("min_seq_len", 0)
-        if min_seq_len > 0:
-            n_before = len(df)
-            df = df.filter(pl.col("n_tokens") >= min_seq_len)
-            log.info("Dropped %d rows shorter than %d tokens", n_before - len(df), min_seq_len)
+        n_before = len(df)
+        df = df.filter(pl.col("n_tokens") >= cfg.min_seq_len)
+        log.info("Dropped %d rows shorter than %d tokens", n_before - len(df), cfg.min_seq_len)
 
         out_path = Path(cfg.processed)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -106,16 +103,15 @@ class SquadDataset(SingleDocQADataset):
         from datasets import load_dataset
 
         cfg = self.cfg
-        ds = load_dataset("rajpurkar/squad", split=cfg.get("split", "train"))
+        ds = load_dataset("rajpurkar/squad", split=cfg.split)
 
         groups: dict[str, list[dict]] = {}
         for row in ds:
             groups.setdefault(row["context"], []).append(row)
 
-        min_q = cfg.get("min_questions", 3)
         rows, gid = [], 0
         for ctx, qas in groups.items():
-            if len(qas) < min_q:
+            if len(qas) < cfg.min_questions:
                 continue
             for i, row in enumerate(qas):
                 answer = row["answers"]["text"][0] if row["answers"]["text"] else ""
@@ -138,17 +134,16 @@ class QuALITYDataset(SingleDocQADataset):
         from datasets import load_dataset
 
         cfg = self.cfg
-        ds = load_dataset("tasksource/QuALITY", split=cfg.get("split", "train"))
+        ds = load_dataset("tasksource/QuALITY", split=cfg.split)
 
         # Group by article_id
         groups: dict[str, list[dict]] = defaultdict(list)
         for row in ds:
             groups[row["article_id"]].append(row)
 
-        min_q = cfg.get("min_questions", 3)
         rows, gid = [], 0
         for article_id, qas in groups.items():
-            if len(qas) < min_q:
+            if len(qas) < cfg.min_questions:
                 continue
             article = qas[0]["article"]
             for i, row in enumerate(qas):
@@ -167,7 +162,10 @@ class MuLDDataset(SingleDocQADataset):
 
     Loads raw bz2-compressed JSONL from ghomasHudson/muld HF repo.
     Each line: {"input": str, "output": str|list[str], "metadata": str}.
-    We group by input text (the document); each output becomes a request.
+
+    For NarrativeQA the input is "Question ï»¿Document" or "Question <html>..."
+    We split question from document, group by document, and construct:
+      text = document + " Question: " + question + " Answer: " + answer
     """
 
     _SUBSET_FILES = {
@@ -179,42 +177,66 @@ class MuLDDataset(SingleDocQADataset):
         "VLSP": "vlsp",
     }
 
+    @staticmethod
+    def _split_question_doc(inp: str) -> tuple[str, str]:
+        """Split MuLD input into (question, document).
+
+        NarrativeQA format: "Question? ï»¿Document..." or "Question? <html>..."
+        """
+        if "\ufeff" in inp:
+            q, doc = inp.split("\ufeff", 1)
+            return q.strip(), doc.strip()
+        if "<html>" in inp:
+            idx = inp.index("<html>")
+            return inp[:idx].strip(), inp[idx:]
+        # Fallback: split at first '?'
+        if "?" in inp:
+            idx = inp.index("?") + 1
+            return inp[:idx].strip(), inp[idx:].strip()
+        return "", inp
+
     def _load_raw(self) -> list[dict]:
         import bz2
+        import hashlib
         import json
         from huggingface_hub import hf_hub_download
 
         cfg = self.cfg
-        subset = cfg.get("subset", "NarrativeQA")
-        split = cfg.get("split", "train")
+        subset = cfg.subset
+        split = cfg.split
         file_key = self._SUBSET_FILES[subset]
         filename = f"data/{file_key}_{split}.json.bz2"
 
         path = hf_hub_download("ghomasHudson/muld", filename, repo_type="dataset")
 
-        # Parse JSONL from bz2
-        all_rows = []
+        # Parse JSONL from bz2, group by document
+        # doc_hash -> {"doc": str, "qas": [(question, answer)]}
+        doc_groups: dict[str, dict] = {}
+        n_read = 0
         with bz2.open(path, "rt") as f:
-            for line in f:
+            for line in tqdm(f, total=cfg.max_rows, desc="pre-filtering"):
+                if n_read >= cfg.max_rows:
+                    break
                 row = json.loads(line)
-                if not isinstance(row["output"], list):
-                    row["output"] = [row["output"]]
-                all_rows.append(row)
+                outputs = row["output"] if isinstance(row["output"], list) else [row["output"]]
+                question, doc = self._split_question_doc(row["input"])
+                doc_hash = hashlib.md5(doc.encode()).hexdigest()
 
-        # Group by input text
-        groups: dict[str, list[str]] = defaultdict(list)
-        for row in all_rows:
-            for out in row["output"]:
-                groups[row["input"]].append(out)
+                if doc_hash not in doc_groups:
+                    doc_groups[doc_hash] = {"doc": doc, "qas": []}
+                for out in outputs:
+                    doc_groups[doc_hash]["qas"].append((question, out))
+                    n_read += 1
 
-        min_q = cfg.get("min_questions", 2)
         rows, gid = [], 0
-        for inp, outputs in groups.items():
-            if len(outputs) < min_q:
+        for doc_hash, grp in doc_groups.items():
+            if len(grp["qas"]) < cfg.min_questions:
                 continue
-            for i, out in enumerate(outputs):
-                text = f"{inp} Answer: {out}"
+            doc = grp["doc"]
+            for i, (question, answer) in enumerate(grp["qas"]):
+                text = f"{doc} Question: {question} Answer: {answer}"
                 rows.append({"group_id": gid, "idx": i, "text": text})
             gid += 1
-        log.info("MuLD/%s: %d documents, %d instances", subset, gid, len(rows))
+        log.info("MuLD/%s: %d documents, %d instances (read %d raw rows)",
+                 subset, gid, len(rows), n_read)
         return rows

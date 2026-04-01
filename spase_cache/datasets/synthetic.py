@@ -36,12 +36,7 @@ class SyntheticDataset(Dataset):
         n_convs = cfg.n_convs
         seq_len = cfg.seq_len
         n_requests = cfg.n_requests
-        seed = cfg.get("seed", 42)
-
-        # overlap distribution parameters
-        overlap_dist = cfg.get("overlap_dist", "uniform")
-        overlap_min = cfg.get("overlap_min", 0)
-        overlap_max = cfg.get("overlap_max", seq_len)
+        seed = cfg.seed
 
         rng = np.random.RandomState(seed)
 
@@ -61,16 +56,15 @@ class SyntheticDataset(Dataset):
             conv = req_idx % n_convs
 
             # Sample overlap length
-            if overlap_dist == "uniform":
-                L = rng.randint(overlap_min, overlap_max + 1)
-            elif overlap_dist == "normal":
-                mu = cfg.get("overlap_mu", seq_len * 0.7)
-                sigma = cfg.get("overlap_sigma", seq_len * 0.1)
-                L = int(np.clip(rng.normal(mu, sigma), overlap_min, overlap_max))
-            elif overlap_dist == "fixed":
-                L = cfg.get("overlap_length", seq_len // 2)
+            if cfg.overlap_dist == "uniform":
+                L = rng.randint(cfg.overlap_min, cfg.overlap_max + 1)
+            elif cfg.overlap_dist == "normal":
+                L = int(np.clip(rng.normal(cfg.overlap_mu, cfg.overlap_sigma),
+                                cfg.overlap_min, cfg.overlap_max))
+            elif cfg.overlap_dist == "fixed":
+                L = cfg.overlap_length
             else:
-                raise ValueError(f"Unknown overlap_dist: {overlap_dist}")
+                raise ValueError(f"Unknown overlap_dist: {cfg.overlap_dist}")
 
             L = int(np.clip(L, 0, seq_len))
 
@@ -86,7 +80,7 @@ class SyntheticDataset(Dataset):
 
         log.info(
             "Generated %d synthetic requests: %d convs, seq_len=%d, overlap_dist=%s",
-            n_requests, n_convs, seq_len, overlap_dist,
+            n_requests, n_convs, seq_len, cfg.overlap_dist,
         )
 
     def conv_id(self, request) -> str:

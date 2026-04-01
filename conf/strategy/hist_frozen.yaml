@@ -6,6 +6,9 @@ n_blocks: 1
 tag: "hist_frozen_${n_blocks}"
 type: "histogram_frozen"
 bin_size: 64
-label: "DP-optimal (frozen, ${n_blocks} blocks, ${bin_size} bin size)"
+gamma: 1.0
+replan_interval: 999999999
+family_label: "DP-frozen"
+label: "DP-frozen (${n_blocks} blocks, bin=${bin_size})"
 color: "tab:purple"
 marker: "X"

@@ -21,7 +21,7 @@ STRATEGIES = [
 def balanced_positions(seq_len, block_size=None, n_blocks=None):
     assert (block_size is None) != (n_blocks is None)
     if n_blocks is not None:
-        block_size = seq_len // (n_blocks + 1)
+        block_size = max(1, seq_len // (n_blocks + 1))
         return list(range(block_size, seq_len + 1, block_size))[:n_blocks]
     return list(range(block_size, seq_len + 1, block_size))
 
@@ -39,7 +39,7 @@ def diadic_positions(seq_len: int, start_at) -> list[int]:
     return positions
 
 def checkpoint_positions(seq_len, *, type, block_size=None, n_blocks=None, start_at=0, skip=0,
-                         histogram_tracker=None,save_last=False, **_ignored):
+                         histogram_tracker=None, save_last=False, kernel_block_size=64, **_ignored):
     """Return list of positions where GDN checkpoints should be captured.
 
     Dispatches on `type` (the strategy type), not `tag` (the unique ID).
@@ -71,7 +71,8 @@ def checkpoint_positions(seq_len, *, type, block_size=None, n_blocks=None, start
 
     if save_last and seq_len not in positions:
         positions.append(seq_len)
-    return sorted(set(positions))
+    return sorted({(x // kernel_block_size) * kernel_block_size for x in positions})
+
 # ---------------------------------------------------------------------------
 # DP-optimal checkpoint placement (Corollary 1 from the paper)
 # ---------------------------------------------------------------------------
@@ -251,6 +252,4 @@ class HistogramTracker:
         """Solve and freeze — no further updates to positions."""
         self.solve()
         self.mode = 'frozen'
-
-
 

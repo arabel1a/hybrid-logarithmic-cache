@@ -123,13 +123,13 @@ def setup_output_dir(cfg, task: str):
 
     out_dir = root_dir / task
     if out_dir.exists():
-        if not cfg.get("overwrite", True): 
+        if not cfg.overwrite:
             raise FileExistsError(f"Output dir already exists and overwrite=False: {out_dir}")
         else:
              shutil.rmtree(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    level = getattr(logging, cfg.get("log_level", "INFO").upper(), logging.INFO)
+    level = getattr(logging, cfg.log_level.upper())
 
     file_handler = logging.FileHandler(out_dir / "run.log")
     file_handler.setLevel(level)
@@ -459,7 +459,7 @@ class PrefixCache:
         """
         best_store = None
         best_len = 0
-        for key in self._conv_entries.get(conv_id, []):
+        for key in self._conv_entries[conv_id]:
             if key not in self.entries:
                 continue
             store = self.entries[key][0]
@@ -490,10 +490,7 @@ class PrefixCache:
             # clean up conv index
             ecid = evicted_key[0]
             if ecid in self._conv_entries:
-                try:
-                    self._conv_entries[ecid].remove(evicted_key)
-                except ValueError:
-                    pass
+                self._conv_entries[ecid].remove(evicted_key)
                 if not self._conv_entries[ecid]:
                     del self._conv_entries[ecid]
 
@@ -538,7 +535,7 @@ class FixedSizeCache:
     def find_best_prefix(self, conv_id, input_ids):
         best_store = None
         best_len = 0
-        for key in self._conv_entries.get(conv_id, []):
+        for key in self._conv_entries[conv_id]:
             if key not in self.entries:
                 continue
             store = self.entries[key]
@@ -555,10 +552,7 @@ class FixedSizeCache:
             evicted_key, _ = self.entries.popitem(last=False)
             ecid = evicted_key[0]
             if ecid in self._conv_entries:
-                try:
-                    self._conv_entries[ecid].remove(evicted_key)
-                except ValueError:
-                    pass
+                self._conv_entries[ecid].remove(evicted_key)
                 if not self._conv_entries[ecid]:
                     del self._conv_entries[ecid]
 
