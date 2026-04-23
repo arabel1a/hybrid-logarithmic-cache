@@ -8,8 +8,6 @@ import torch
 import torch.nn.functional as F
 import logging
 
-# TODO: move my chunked prefill here
-
 # ---------------------------------------------------------------------------
 # Enforce non-eager attention.
 # I need it because eager implementation allows only 8K context compared to
