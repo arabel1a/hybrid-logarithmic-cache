@@ -3,7 +3,7 @@
 All checkpoint strategies store both GDN recurrent states and attention KV cache.
 Results saved to baselines_results.json.
 """
-import sparse_prefix_cacing
+import sparse_prefix_caching
 import json
 import logging
 import time
@@ -15,6 +15,7 @@ from omegaconf import DictConfig, OmegaConf
 from sparse_prefix_caching.checkpoint_cache import (
     prefill_from_checkpoint,
 )
+from sparse_prefix_caching.patches import capture_gdn_states
 from sparse_prefix_caching.utils import (
     setup_output_dir,
     resolve_strategies,
@@ -25,7 +26,7 @@ from sparse_prefix_caching.utils import (
     gpu_mb,
     free_gpu,
     reset_peak_memory,
-    prefill_and_capture_at,
+    build_store_from_captures,
     time_fn,
     warmup,
 )
@@ -94,11 +95,17 @@ def main(cfg: DictConfig):
                 continue  # histogram strategies need trace data, skip in single-seq benchmark
 
             positions = checkpoint_positions(N, **strat)
+
+            # Single-pass capture: prefill + state extraction in one forward pass
             _sync_device(dev)
             cap_t0 = time.perf_counter()
-            store = prefill_and_capture_at(model, input_ids, positions)
+            with capture_gdn_states(positions) as captured:
+                _, model_cache = prefill_baseline(model, input_ids)
             _sync_device(dev)
             cap_times[strat.tag] = time.perf_counter() - cap_t0
+            store = build_store_from_captures(
+                captured, input_ids, positions, model_cache, config,
+            )
             bytes_map[strat.tag] = store.memory_bytes()
             store.to("cpu")
 
