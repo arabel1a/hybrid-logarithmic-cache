@@ -2,6 +2,7 @@ overwrite: True
 
 defaults:
   - config
+  - data: quality
   - _self_
 
 run_name: smoke

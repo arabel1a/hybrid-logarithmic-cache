@@ -1,0 +1,34 @@
+defaults:
+  - config
+  - data: quality
+  - _self_
+overwrite: True
+run_name: clean_dbg
+ 
+data:
+  interleave: True
+  max_seq_len: 16384
+  min_seq_len: 8000
+  max_rows: 1000
+
+strategies:
+  no_cache: {}
+  log: {}
+  sqrt: {}
+  block_64: {_base_: block, block_size: 64}
+  dp_300: {_base_: hist_exp_decay, n_blocks: 300}
+  balanced_300: {_base_: balanced, n_blocks: 300}
+  # Balanced
+  balanced_1:  {_base_: balanced, n_blocks: 1}
+  balanced_2:  {_base_: balanced, n_blocks: 2}
+  balanced_5:  {_base_: balanced, n_blocks: 5}
+  balanced_30: {_base_: balanced, n_blocks: 30}
+  # DP-optimal
+  dp_1:  {_base_: hist_exp_decay, n_blocks: 1}
+  dp_2:  {_base_: hist_exp_decay, n_blocks: 2}
+  dp_5:  {_base_: hist_exp_decay, n_blocks: 5}
+  dp_30: {_base_: hist_exp_decay, n_blocks: 30}
+
+plot_results:
+ _target_: plot_results.plot_all
+ break_at: 35
