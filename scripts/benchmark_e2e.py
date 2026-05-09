@@ -277,7 +277,7 @@ def simulate(model, dataset, requests, vocab_size, strategy,
             "conv_id": str(conv_id), 
             "seq_len": seq_len,
             "added_positions": positions,
-            "time_s": t9 - t4 + t3 - t0, # exclude histogram re-solving
+            "time_s": t9 - t0, # exclude histogram re-solving
             "find_best_prefix_s": t1 - t0,
             "ids_to_device_s": t2 - t1,
             "hist_observe_s": t3 - t2,
