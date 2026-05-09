@@ -1,6 +1,7 @@
 """Caching strategy for prefix checkpoint evaluation."""
 import logging
 import math
+from concurrent.futures import ProcessPoolExecutor, Future
 from functools import lru_cache
 import numpy as np
 
@@ -192,6 +193,16 @@ class HistogramTracker:
         self._n_solves = 0
         self.histogram_log = []  # list of {n_obs, counts}
 
+        # Async solving state
+        self._executor = ProcessPoolExecutor(max_workers=1)
+        self._pending_future: Future | None = None
+        self._n_obs_at_last_solve = 0  # n_obs when the current _dp_result was produced
+
+    @property
+    def dp_staleness(self):
+        """Number of observations since the current DP solution was computed."""
+        return self.n_obs - self._n_obs_at_last_solve
+
     def observe(self, overlap_depth):
         """Record an observed overlap depth."""
         b = min(_bin_index(max(int(overlap_depth), 0), self.bin_size),
@@ -203,7 +214,7 @@ class HistogramTracker:
         self._dirty = True
 
     def solve(self):
-        """Solve DP on current (binned) histogram and store full DP tables."""
+        """Solve DP on current (binned) histogram and store full DP tables (synchronous)."""
         self.histogram_log.append({
             "n_obs": self.n_obs,
             "counts": self.counts.copy(),
@@ -222,7 +233,56 @@ class HistogramTracker:
                 self._fixed_positions = token_positions
         self._backtrack_bins.cache_clear()
         self._n_solves += 1
+        self._n_obs_at_last_solve = self.n_obs
         self._dirty = False
+
+    def _kick_solve(self):
+        """Snapshot histogram and submit DP solve to background process."""
+        hist_snapshot = self.counts.copy()
+        smoothed = laplace_smoothing(hist_snapshot, self.alpha)
+        n_obs_snapshot = self.n_obs
+        self._pending_future = self._executor.submit(
+            solve_dp, smoothed, self.budget
+        )
+        self._pending_future._hist_snapshot = hist_snapshot
+        self._pending_future._n_obs_snapshot = n_obs_snapshot
+        self._dirty = False
+
+    def _try_adopt_result(self):
+        """Non-blocking check: adopt background solve result if ready. Returns True if adopted."""
+        if self._pending_future is None:
+            return False
+        if not self._pending_future.done():
+            return False
+
+        hist_snapshot = self._pending_future._hist_snapshot
+        n_obs_snapshot = self._pending_future._n_obs_snapshot
+        try:
+            result = self._pending_future.result()
+        except Exception as e:
+            log.warning("Background DP solve failed: %s", e)
+            self._pending_future = None
+            return False
+
+        self._pending_future = None
+        self._dp_result = result
+        self._backtrack_bins.cache_clear()
+        self._n_solves += 1
+        self._n_obs_at_last_solve = n_obs_snapshot
+        self.histogram_log.append({"n_obs": n_obs_snapshot, "counts": hist_snapshot})
+
+        if result is not None:
+            _, N, M = result
+            positions = self._backtrack_bins(N)
+            token_positions = [_bin_to_pos(b, self.bin_size) for b in positions]
+            log.info("DP solved (async): %d ckpts, n_obs=%d, bin_size=%d, positions=%s",
+                     len(positions), n_obs_snapshot, self.bin_size, token_positions)
+            if not self.adaptive_backtrack:
+                self._fixed_positions = token_positions
+        else:
+            log.info("DP solve (async): degenerate histogram, using balanced fallback")
+
+        return True
 
     @lru_cache(maxsize=256)
     def _backtrack_bins(self, j_bin):
@@ -232,21 +292,33 @@ class HistogramTracker:
         return backtrack(all_back, M, j)
 
     def get_positions(self, seq_len):
-        """Get checkpoint positions for a request of given length."""
-        if self._dp_result is None:
-            # No DP solution yet — use balanced fallback until first solve
-            block = max(1, seq_len // (self.budget + 1))
-            return list(range(block, seq_len + 1, block))[:self.budget]
-
-        should_solve = False
+        """Get checkpoint positions for a request of given length (non-blocking)."""
         if self.mode == 'frozen':
-            pass
-        elif self.mode in ('periodic', 'exp_decay'):
-            if self._dirty and self.n_obs % self.replan_interval == 0:
-                should_solve = True
+            # Frozen mode: no async, use whatever we have
+            if self._dp_result is None:
+                block = max(1, seq_len // (self.budget + 1))
+                return list(range(block, seq_len + 1, block))[:self.budget]
+        else:
+            # Check if async solve completed and adopt result
+            self._try_adopt_result()
 
-        if should_solve:
-            self.solve()
+            # Maybe kick off a new solve
+            if self._pending_future is None:
+                should_kick = False
+                if self._dp_result is None:
+                    # First solve: wait until enough warmup observations
+                    if self.n_obs >= self.replan_interval:
+                        should_kick = True
+                elif self._dirty and self.n_obs % self.replan_interval == 0:
+                    should_kick = True
+
+                if should_kick:
+                    self._kick_solve()
+
+            # If still no DP result, use balanced fallback
+            if self._dp_result is None:
+                block = max(1, seq_len // (self.budget + 1))
+                return list(range(block, seq_len + 1, block))[:self.budget]
 
         if not self.adaptive_backtrack and self._fixed_positions is not None:
             return [p for p in self._fixed_positions if 0 < p <= seq_len]
@@ -257,6 +329,14 @@ class HistogramTracker:
 
     def freeze(self):
         """Solve and freeze — no further updates to positions."""
+        # Wait for any in-flight async solve before final sync solve
+        if self._pending_future is not None:
+            self._pending_future.result()  # blocks
+            self._pending_future = None
         self.solve()
         self.mode = 'frozen'
+
+    def __del__(self):
+        if hasattr(self, '_executor'):
+            self._executor.shutdown(wait=False)
 

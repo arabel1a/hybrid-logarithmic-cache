@@ -274,7 +274,7 @@ def simulate(model, dataset, requests, vocab_size, strategy,
                 reusable_gdn = ckpt.position
  
         per_request.append({
-            "conv_id": str(conv_id), 
+            "conv_id": str(conv_id),
             "seq_len": seq_len,
             "added_positions": positions,
             "time_s": t9 - t0, # exclude histogram re-solving
@@ -287,15 +287,16 @@ def simulate(model, dataset, requests, vocab_size, strategy,
             "prefill_and_sync_s": t7 - t5,
             "build_store_s": t8 - t7,
             "put_store_s": t9 - t8,
-            "capture_s": t9-t7, 
+            "capture_s": t9-t7,
             "hit": hit,
             "tokens_saved": tokens_saved,
-            "reusable_kv": reusable_kv, 
+            "reusable_kv": reusable_kv,
             "reusable_gdn": reusable_gdn,
             "prefix_match": match_len,
             "n_cache_entries": cache.n_entries,
             "cache_kv_bytes": cache.kv_used,
             "cache_gdn_bytes": cache.gdn_used,
+            "dp_staleness": histogram_tracker.dp_staleness if histogram_tracker is not None else 0,
         })
 
     wall_time = time.perf_counter() - wall_t0
