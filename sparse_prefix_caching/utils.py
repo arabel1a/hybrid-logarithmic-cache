@@ -32,7 +32,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Strategy resolution
 # ---------------------------------------------------------------------------
-_STRATEGY_DIR = Path(__file__).resolve().parent.parent / "conf" / "strategy"
+_STRATEGY_DIR =  Path("conf/strategy")
 
 
 def resolve_strategies(cfg):
